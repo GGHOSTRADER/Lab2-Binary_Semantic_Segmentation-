@@ -284,7 +284,9 @@ class OxfordPetDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:
+    def __getitem__(
+        self, index: int
+    ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, str]:
         sample = self.samples[index]
 
         image = self._load_rgb_image(sample.image_path)
@@ -297,6 +299,9 @@ class OxfordPetDataset(Dataset):
         image_tensor = self._normalize_image(image_tensor)
 
         mask_tensor = self._mask_to_tensor(binary_mask)
+
+        if self.split == "test":
+            return image_tensor, mask_tensor, sample.pet_id
 
         return image_tensor, mask_tensor
 
