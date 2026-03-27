@@ -1,0 +1,28 @@
+flowchart TD
+
+A[trainval.txt or test.txt<br/>list of IDs] --> B[pet_id strings]
+
+B --> C[Build file paths<br/>image_path + mask_path]
+
+C --> D[Load Image<br/>&#40;H,W,3 &#41;]
+C --> E[Load Trimap Mask<br/>&#40;H,W &#41;]
+
+E --> F[Convert Trimap → Binary Mask<br/>&#123; 1→1, 2,3→0&#125;]
+F --> G[Binary Mask<br/>&#40;H,W&#41; values &#123; 0,1&#125;]
+
+D --> H[Apply Resize / Augmentation]
+G --> H
+
+H --> I[Resized Image<br/>&#40;H,W,3 &#41;]
+H --> J[Resized Mask<br/>&#40;H,W &#41;]
+
+I --> K[Convert Image → Tensor<br/>&#40;3,H,W &#41;]
+J --> L[Convert Mask → Tensor<br/>&#40;1,H,W &#41;]
+
+K --> M[Normalize Image Tensor]
+M --> N[Final Image Tensor<br/>&#40;3,H,W &#41;]
+
+L --> O[Final Mask Tensor<br/>&#40;1,H,W &#41;]
+
+N --> P[Model Input]
+O --> Q[Ground Truth Target]

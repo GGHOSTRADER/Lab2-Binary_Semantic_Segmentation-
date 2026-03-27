@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+saved_models/*.pth
+dataset/oxford-iiit-pet/images/
+dataset/oxford-iiit-pet/annotations/

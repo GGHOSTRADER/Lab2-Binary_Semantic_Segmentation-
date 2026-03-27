@@ -1,0 +1,34 @@
+flowchart TD
+    A[Initialize OxfordPetDataset] --> B[Store root split image_size val_ratio seed augment]
+    B --> C[Set dataset paths]
+    C --> D[Validate required paths exist]
+
+    D --> E[Build samples]
+    E --> F{Requested split?}
+
+    F -->|test| G[Read IDs from test.txt]
+    G --> H[Create sample pairs image path and mask path]
+    H --> I[Dataset ready]
+
+    F -->|trainval| J[Read IDs from trainval.txt]
+    J --> K[Create sample pairs image path and mask path]
+    K --> I
+
+    F -->|train or val| L[Read IDs from trainval.txt]
+    L --> M[Deterministically shuffle IDs]
+    M --> N[Split IDs into train and val]
+    N --> O{train or val?}
+    O -->|train| P[Create train sample pairs]
+    O -->|val| Q[Create val sample pairs]
+    P --> I
+    Q --> I
+
+    I --> R[__getitem__ called]
+    R --> S[Load RGB image]
+    S --> T[Load trimap mask]
+    T --> U[Convert trimap to binary mask]
+    U --> V[Apply joint transforms to image and mask]
+    V --> W[Convert image to tensor]
+    W --> X[Normalize image tensor]
+    X --> Y[Convert mask to tensor]
+    Y --> Z[Return image tensor and mask tensor]
