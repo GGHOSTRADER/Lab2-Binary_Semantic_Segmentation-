@@ -7,8 +7,8 @@ from torch import nn
 from torch.optim import Adam
 from torch.utils.data import DataLoader
 
-from oxford_pet import OxfordPetDataset
-from models.unet import UNet
+from oxford_pet import OxfordPetDataset2015
+from models.unet import UNet2015
 from evaluate import validate_one_epoch, dice_score_from_logits
 from utils import get_device, ensure_dir, save_checkpoint, set_seed
 
@@ -27,12 +27,12 @@ def train_one_epoch(
     num_batches = 0
 
     for images, masks in dataloader:
-        images = images.to(device)
-        masks = masks.to(device)
+        images = images.to(device, non_blocking=True)
+        masks = masks.to(device, dtype=torch.long, non_blocking=True)
 
         optimizer.zero_grad()
 
-        logits = model(images)
+        logits = model(images)  # expected: (B, 2, 388, 388)
         loss = criterion(logits, masks)
 
         loss.backward()
@@ -49,47 +49,26 @@ def train_one_epoch(
     return mean_loss, mean_dice
 
 
-def main() -> None:
-    # -----------------------------
-    # Config
-    # -----------------------------
-    dataset_root = "dataset/oxford-iiit-pet"
-    image_size = (256, 256)
-
-    batch_size = 8
-    num_epochs = 30
-    learning_rate = 1e-3
-    num_workers = 0
-
-    model_save_dir = ensure_dir("saved_models")
-    best_model_path = model_save_dir / "unet_best.pth"
-
-    device = get_device()
-    print(f"Using device: {device}")
-
-    # -----------------------------
-    # Datasets
-    # -----------------------------
-    train_dataset = OxfordPetDataset(
+def build_dataloaders(
+    dataset_root: str,
+    batch_size: int,
+    num_workers: int,
+) -> tuple[DataLoader, DataLoader]:
+    train_dataset = OxfordPetDataset2015(
         root=dataset_root,
         split="train",
-        image_size=image_size,
         augment=True,
     )
 
-    val_dataset = OxfordPetDataset(
+    val_dataset = OxfordPetDataset2015(
         root=dataset_root,
         split="val",
-        image_size=image_size,
         augment=False,
     )
 
     print(f"Train dataset size: {len(train_dataset)}")
     print(f"Val dataset size:   {len(val_dataset)}")
 
-    # -----------------------------
-    # Dataloaders
-    # -----------------------------
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -106,11 +85,52 @@ def main() -> None:
         pin_memory=torch.cuda.is_available(),
     )
 
+    return train_loader, val_loader
+
+
+def build_model(device: torch.device) -> nn.Module:
+    """
+    Strict 2015 U-Net geometry, adapted only at the input layer
+    to accept RGB images.
+    """
+    model = UNet2015(in_channels=3, out_channels=2).to(device)
+    return model
+
+
+def main() -> None:
+    # -----------------------------
+    # Config
+    # -----------------------------
+    set_seed(42)
+
+    dataset_root = "dataset/oxford-iiit-pet"
+
+    batch_size = 6
+    num_epochs = 1
+    learning_rate = 1e-4
+    num_workers = 4
+
+    model_save_dir = ensure_dir("saved_models")
+    best_model_path = model_save_dir / "unet2015_rgb_best.pth"
+
+    device = get_device()
+    print(f"Using device: {device}")
+
+    # -----------------------------
+    # Dataloaders
+    # -----------------------------
+    train_loader, val_loader = build_dataloaders(
+        dataset_root=dataset_root,
+        batch_size=batch_size,
+        num_workers=num_workers,
+    )
+
     # -----------------------------
     # Model / Loss / Optimizer
     # -----------------------------
-    model = UNet(in_channels=3, out_channels=1).to(device)
-    criterion = nn.BCEWithLogitsLoss()
+    model = build_model(device=device)
+
+    criterion = nn.CrossEntropyLoss()
     optimizer = Adam(model.parameters(), lr=learning_rate)
 
     best_val_dice = -1.0

@@ -17,7 +17,7 @@ def set_seed(seed: int = 42) -> None:
     Notes
     -----
     Full determinism on GPU can reduce performance and is not always guaranteed
-    across all operations, but this makes the run much more reproducible.
+    across all operations, but this makes the run more reproducible.
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -72,25 +72,36 @@ def load_checkpoint(
     if not path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
 
-    state_dict = torch.load(path, map_location=device)
+    try:
+        state_dict = torch.load(path, map_location=device, weights_only=True)
+    except TypeError:
+        state_dict = torch.load(path, map_location=device)
+
     model.load_state_dict(state_dict)
     return model
 
 
-def save_binary_mask(
+def save_class_mask(
     mask_tensor: Tensor,
     save_path: str | Path,
+    foreground_class: int = 1,
 ) -> None:
     """
-    Save a predicted binary mask to disk as a PNG image.
+    Save a predicted segmentation mask to disk as a PNG image.
 
     Parameters
     ----------
     mask_tensor:
-        Expected shape: (H, W) or (1, H, W)
-        Expected values: {0, 1} or float values already thresholded.
+        Expected shape:
+        - (H, W): class-index mask
+        - (1, H, W): class-index mask with singleton channel
+        Values are expected to be integer class labels.
+
     save_path:
         Output path ending in .png
+
+    foreground_class:
+        Class index to visualize as white (255). Everything else becomes black (0).
     """
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -107,9 +118,8 @@ def save_binary_mask(
             f"Expected mask shape (H, W) or (1, H, W), got {tuple(mask_tensor.shape)}"
         )
 
-    mask_uint8 = (
-        (mask_tensor.detach().cpu().float() * 255.0).clamp(0, 255).to(torch.uint8)
-    )
-    mask_np = mask_uint8.numpy()
+    mask_tensor = mask_tensor.detach().cpu()
+    binary_mask = (mask_tensor == foreground_class).to(torch.uint8) * 255
+    mask_np = binary_mask.numpy()
 
     Image.fromarray(mask_np, mode="L").save(save_path)

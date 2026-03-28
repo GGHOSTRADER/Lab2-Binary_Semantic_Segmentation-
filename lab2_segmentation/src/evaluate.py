@@ -6,26 +6,49 @@ from torch.utils.data import DataLoader
 
 
 def dice_score_from_logits(
-    logits: Tensor, targets: Tensor, eps: float = 1e-7
+    logits: Tensor,
+    targets: Tensor,
+    foreground_class: int = 1,
+    eps: float = 1e-7,
 ) -> Tensor:
     """
-    Compute mean Dice score across a batch.
+    Compute mean Dice score across a batch for the foreground class.
 
     Args:
-        logits:  (B, 1, H, W) raw model outputs
-        targets: (B, 1, H, W) binary ground-truth masks
+        logits:
+            Raw model outputs of shape (B, C, H, W),
+            where C is the number of classes.
+        targets:
+            Ground-truth class indices of shape (B, H, W),
+            with integer values in {0, ..., C-1}.
+        foreground_class:
+            Class index to evaluate Dice for.
+        eps:
+            Small constant for numerical stability.
 
     Returns:
         Scalar tensor with mean batch Dice.
     """
-    probs = torch.sigmoid(logits)
-    preds = (probs > 0.5).float()
+    if logits.ndim != 4:
+        raise ValueError(
+            f"logits must have shape (B, C, H, W), got {tuple(logits.shape)}"
+        )
 
-    preds = preds.view(preds.size(0), -1)
-    targets = targets.view(targets.size(0), -1)
+    if targets.ndim != 3:
+        raise ValueError(
+            f"targets must have shape (B, H, W), got {tuple(targets.shape)}"
+        )
 
-    intersection = (preds * targets).sum(dim=1)
-    denominator = preds.sum(dim=1) + targets.sum(dim=1)
+    preds = torch.argmax(logits, dim=1)
+
+    preds_fg = (preds == foreground_class).float()
+    targets_fg = (targets == foreground_class).float()
+
+    preds_fg = preds_fg.reshape(preds_fg.size(0), -1)
+    targets_fg = targets_fg.reshape(targets_fg.size(0), -1)
+
+    intersection = (preds_fg * targets_fg).sum(dim=1)
+    denominator = preds_fg.sum(dim=1) + targets_fg.sum(dim=1)
 
     dice = (2.0 * intersection + eps) / (denominator + eps)
     return dice.mean()
@@ -38,6 +61,17 @@ def validate_one_epoch(
     criterion: nn.Module,
     device: torch.device,
 ) -> tuple[float, float]:
+    """
+    Validation loop for original-style U-Net segmentation.
+
+    Expected:
+        images: (B, 1, 572, 572) or generally (B, C_in, H_in, W_in)
+        masks:  (B, H_out, W_out) with class indices
+        logits: (B, 2, H_out, W_out)
+
+    Criterion should typically be:
+        nn.CrossEntropyLoss()
+    """
     model.eval()
 
     running_loss = 0.0
@@ -46,7 +80,7 @@ def validate_one_epoch(
 
     for images, masks in dataloader:
         images = images.to(device)
-        masks = masks.to(device)
+        masks = masks.to(device, dtype=torch.long)
 
         logits = model(images)
         loss = criterion(logits, masks)
