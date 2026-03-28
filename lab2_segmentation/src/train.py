@@ -75,6 +75,7 @@ def build_dataloaders(
         shuffle=True,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=num_workers > 0,
     )
 
     val_loader = DataLoader(
@@ -83,6 +84,7 @@ def build_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=num_workers > 0,
     )
 
     return train_loader, val_loader
