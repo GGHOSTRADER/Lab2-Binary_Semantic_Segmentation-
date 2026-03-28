@@ -6,6 +6,7 @@ import torch
 from torch import nn
 from torch.optim import Adam
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from oxford_pet import OxfordPetDataset2015
 from models.unet import UNet2015
@@ -26,7 +27,9 @@ def train_one_epoch(
     running_dice = 0.0
     num_batches = 0
 
-    for images, masks in dataloader:
+    pbar = tqdm(dataloader, desc="Train", leave=False)
+
+    for images, masks in pbar:
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, dtype=torch.long, non_blocking=True)
 
@@ -43,6 +46,13 @@ def train_one_epoch(
         running_loss += loss.item()
         running_dice += dice.item()
         num_batches += 1
+
+        mean_loss_so_far = running_loss / num_batches
+        mean_dice_so_far = running_dice / num_batches
+        pbar.set_postfix(
+            loss=f"{mean_loss_so_far:.4f}",
+            dice=f"{mean_dice_so_far:.4f}",
+        )
 
     mean_loss = running_loss / max(1, num_batches)
     mean_dice = running_dice / max(1, num_batches)
@@ -107,7 +117,7 @@ def main() -> None:
 
     dataset_root = "dataset/oxford-iiit-pet"
 
-    batch_size = 6
+    batch_size = 1
     num_epochs = 1
     learning_rate = 1e-4
     num_workers = 4
