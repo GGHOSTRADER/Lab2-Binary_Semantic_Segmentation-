@@ -90,11 +90,9 @@ def logits_to_resized_binary_mask(
             f"Expected 2 output channels for strict 2015 setup, got C={logits_single.shape[0]}"
         )
 
-    # Convert logits -> foreground probability map
     probs = torch.softmax(logits_single.unsqueeze(0), dim=1)[:, 1:2, :, :]
     # Shape: (1, 1, H_pred, W_pred)
 
-    # Resize probability map back to original image size
     probs_resized = F.interpolate(
         probs,
         size=original_size,
@@ -121,6 +119,7 @@ def run_inference(
     dataloader: DataLoader,
     device: torch.device,
     dataset_root: str | Path,
+    threshold: float = 0.5,
 ) -> list[tuple[str, str]]:
     """
     Run inference on the test set and return rows:
@@ -146,7 +145,7 @@ def run_inference(
             binary_mask = logits_to_resized_binary_mask(
                 sample_logits,
                 original_size=original_size,
-                threshold=0.5,
+                threshold=threshold,
             )
 
             encoded_mask = mask_to_rle(binary_mask)
@@ -181,14 +180,19 @@ def build_test_dataloader(
         root=dataset_root,
         split="test",
         augment=False,
+        return_pet_id=True,
     )
+
+    use_pin_memory = torch.cuda.is_available()
+    use_persistent_workers = num_workers > 0
 
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=use_pin_memory,
+        persistent_workers=use_persistent_workers,
     )
 
     return test_loader
@@ -197,6 +201,7 @@ def build_test_dataloader(
 def build_model(device: torch.device, model_path: str | Path) -> nn.Module:
     model = UNet2015(in_channels=3, out_channels=2).to(device)
     model = load_checkpoint(model, model_path, device)
+    model.eval()
     return model
 
 
@@ -204,6 +209,7 @@ def main() -> None:
     dataset_root = "dataset/oxford-iiit-pet"
     batch_size = 8
     num_workers = 0
+    threshold = 0.5
 
     model_path = "saved_models/unet2015_rgb_best.pth"
     submission_path = "submissions/unet2015_rgb_submission.csv"
@@ -226,6 +232,7 @@ def main() -> None:
         dataloader=test_loader,
         device=device,
         dataset_root=dataset_root,
+        threshold=threshold,
     )
 
     if len(submission_rows) != len(test_loader.dataset):

@@ -46,6 +46,18 @@ def dice_score_from_logits(
             f"targets must have shape (B, H, W), got {tuple(targets.shape)}"
         )
 
+    if logits.shape[0] != targets.shape[0]:
+        raise ValueError(
+            f"Batch size mismatch: logits.shape[0]={logits.shape[0]}, "
+            f"targets.shape[0]={targets.shape[0]}"
+        )
+
+    if logits.shape[2:] != targets.shape[1:]:
+        raise ValueError(
+            f"Spatial shape mismatch: logits.shape[2:]={logits.shape[2:]}, "
+            f"targets.shape[1:]={targets.shape[1:]}"
+        )
+
     preds = torch.argmax(logits, dim=1)
 
     preds_fg = (preds == foreground_class).float()
@@ -77,6 +89,12 @@ def dice_score_binary_masks(
     Returns:
         Dice score as float
     """
+    if pred_mask.ndim != 2 or true_mask.ndim != 2:
+        raise ValueError(
+            f"Both masks must be 2D. Got pred_mask.ndim={pred_mask.ndim}, "
+            f"true_mask.ndim={true_mask.ndim}"
+        )
+
     if pred_mask.shape != true_mask.shape:
         raise ValueError(
             f"Shape mismatch: pred_mask.shape={pred_mask.shape}, "
@@ -85,6 +103,15 @@ def dice_score_binary_masks(
 
     pred = pred_mask.astype(np.uint8)
     true = true_mask.astype(np.uint8)
+
+    pred_unique = np.unique(pred)
+    true_unique = np.unique(true)
+
+    if not np.all(np.isin(pred_unique, [0, 1])):
+        raise ValueError(f"pred_mask is not binary. Unique values: {pred_unique}")
+
+    if not np.all(np.isin(true_unique, [0, 1])):
+        raise ValueError(f"true_mask is not binary. Unique values: {true_unique}")
 
     intersection = np.logical_and(pred == 1, true == 1).sum()
     denominator = (pred == 1).sum() + (true == 1).sum()
@@ -171,6 +198,12 @@ def logits_to_original_resolution_mask(
     pred_mask = (probs_fg_resized > threshold).to(torch.uint8)
     pred_mask = pred_mask.squeeze(0).squeeze(0).cpu().numpy()
 
+    unique_values = np.unique(pred_mask)
+    if not np.all(np.isin(unique_values, [0, 1])):
+        raise ValueError(
+            f"Predicted mask is not binary after thresholding. Unique values: {unique_values}"
+        )
+
     return pred_mask
 
 
@@ -196,8 +229,8 @@ def validate_one_epoch(
     num_batches = 0
 
     for images, masks in dataloader:
-        images = images.to(device)
-        masks = masks.to(device, dtype=torch.long)
+        images = images.to(device, non_blocking=True)
+        masks = masks.to(device, dtype=torch.long, non_blocking=True)
 
         logits = model(images)
         loss = criterion(logits, masks)
@@ -253,7 +286,7 @@ def validate_submission_style(
             )
 
         images, _masks, pet_ids = batch
-        images = images.to(device)
+        images = images.to(device, non_blocking=True)
 
         logits = model(images)  # (B, 2, 388, 388)
 

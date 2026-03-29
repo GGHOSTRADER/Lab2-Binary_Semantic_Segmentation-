@@ -37,7 +37,7 @@ def train_one_epoch(
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, dtype=torch.long, non_blocking=True)
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         logits = model(images)  # expected: (B, 2, 388, 388)
         loss = criterion(logits, masks)
@@ -75,7 +75,6 @@ def build_dataloaders(
         return_pet_id=False,
     )
 
-    # Regular validation loader for train-space metric
     val_dataset = OxfordPetDataset2015(
         root=dataset_root,
         split="val",
@@ -83,7 +82,6 @@ def build_dataloaders(
         return_pet_id=False,
     )
 
-    # Submission-style validation loader
     val_dataset_submission = OxfordPetDataset2015(
         root=dataset_root,
         split="val",
@@ -94,13 +92,16 @@ def build_dataloaders(
     print(f"Train dataset size: {len(train_dataset)}")
     print(f"Val dataset size:   {len(val_dataset)}")
 
+    use_pin_memory = torch.cuda.is_available()
+    use_persistent_workers = num_workers > 0
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=num_workers > 0,
+        pin_memory=use_pin_memory,
+        persistent_workers=use_persistent_workers,
     )
 
     val_loader = DataLoader(
@@ -108,8 +109,8 @@ def build_dataloaders(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=num_workers > 0,
+        pin_memory=use_pin_memory,
+        persistent_workers=use_persistent_workers,
     )
 
     val_loader_submission = DataLoader(
@@ -117,8 +118,8 @@ def build_dataloaders(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=num_workers > 0,
+        pin_memory=use_pin_memory,
+        persistent_workers=use_persistent_workers,
     )
 
     return train_loader, val_loader, val_loader_submission
@@ -139,12 +140,19 @@ def main() -> None:
     # -----------------------------
     set_seed(42)
 
+    # If you care more about speed than strict reproducibility,
+    # you can uncomment the next line.
+    # torch.backends.cudnn.benchmark = True
+
     dataset_root = "dataset/oxford-iiit-pet"
 
     batch_size = 1
-    num_epochs = 1
+    num_epochs = 30
     learning_rate = 1e-4
     num_workers = 4
+
+    early_stopping_patience = 5
+    min_delta = 1e-4
 
     model_save_dir = ensure_dir("saved_models")
     best_model_path = model_save_dir / "unet2015_rgb_best.pth"
@@ -170,6 +178,7 @@ def main() -> None:
     optimizer = Adam(model.parameters(), lr=learning_rate)
 
     best_val_submission_dice = -1.0
+    epochs_without_improvement = 0
 
     # -----------------------------
     # Training loop
@@ -185,7 +194,6 @@ def main() -> None:
             device=device,
         )
 
-        # Current train-space validation
         val_loss, val_dice = validate_one_epoch(
             model=model,
             dataloader=val_loader,
@@ -193,7 +201,6 @@ def main() -> None:
             device=device,
         )
 
-        # Submission-style validation
         val_submission_dice = validate_submission_style(
             model=model,
             dataloader=val_loader_submission,
@@ -214,11 +221,24 @@ def main() -> None:
             f"Time: {epoch_time:.1f}s"
         )
 
-        # Save best model based on submission-style validation
-        if val_submission_dice > best_val_submission_dice:
+        if val_submission_dice > best_val_submission_dice + min_delta:
             best_val_submission_dice = val_submission_dice
+            epochs_without_improvement = 0
             save_checkpoint(model, best_model_path)
             print(f"Saved best model to: {best_model_path}")
+        else:
+            epochs_without_improvement += 1
+            print(
+                f"No submission-style val improvement for "
+                f"{epochs_without_improvement} epoch(s)."
+            )
+
+        if epochs_without_improvement >= early_stopping_patience:
+            print(
+                f"Early stopping triggered at epoch {epoch}. "
+                f"Best Val Dice (submission-style): {best_val_submission_dice:.4f}"
+            )
+            break
 
     print(
         f"Training complete. "
