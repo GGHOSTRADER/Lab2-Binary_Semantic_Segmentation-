@@ -10,7 +10,11 @@ from tqdm import tqdm
 
 from oxford_pet import OxfordPetDataset2015
 from models.unet import UNet2015
-from evaluate import validate_one_epoch, dice_score_from_logits
+from evaluate import (
+    validate_one_epoch,
+    validate_submission_style,
+    dice_score_from_logits,
+)
 from utils import get_device, ensure_dir, save_checkpoint, set_seed
 
 
@@ -63,17 +67,28 @@ def build_dataloaders(
     dataset_root: str,
     batch_size: int,
     num_workers: int,
-) -> tuple[DataLoader, DataLoader]:
+) -> tuple[DataLoader, DataLoader, DataLoader]:
     train_dataset = OxfordPetDataset2015(
         root=dataset_root,
         split="train",
         augment=True,
+        return_pet_id=False,
     )
 
+    # Regular validation loader for train-space metric
     val_dataset = OxfordPetDataset2015(
         root=dataset_root,
         split="val",
         augment=False,
+        return_pet_id=False,
+    )
+
+    # Submission-style validation loader
+    val_dataset_submission = OxfordPetDataset2015(
+        root=dataset_root,
+        split="val",
+        augment=False,
+        return_pet_id=True,
     )
 
     print(f"Train dataset size: {len(train_dataset)}")
@@ -97,7 +112,16 @@ def build_dataloaders(
         persistent_workers=num_workers > 0,
     )
 
-    return train_loader, val_loader
+    val_loader_submission = DataLoader(
+        val_dataset_submission,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=num_workers > 0,
+    )
+
+    return train_loader, val_loader, val_loader_submission
 
 
 def build_model(device: torch.device) -> nn.Module:
@@ -131,7 +155,7 @@ def main() -> None:
     # -----------------------------
     # Dataloaders
     # -----------------------------
-    train_loader, val_loader = build_dataloaders(
+    train_loader, val_loader, val_loader_submission = build_dataloaders(
         dataset_root=dataset_root,
         batch_size=batch_size,
         num_workers=num_workers,
@@ -145,7 +169,7 @@ def main() -> None:
     criterion = nn.CrossEntropyLoss()
     optimizer = Adam(model.parameters(), lr=learning_rate)
 
-    best_val_dice = -1.0
+    best_val_submission_dice = -1.0
 
     # -----------------------------
     # Training loop
@@ -161,11 +185,21 @@ def main() -> None:
             device=device,
         )
 
+        # Current train-space validation
         val_loss, val_dice = validate_one_epoch(
             model=model,
             dataloader=val_loader,
             criterion=criterion,
             device=device,
+        )
+
+        # Submission-style validation
+        val_submission_dice = validate_submission_style(
+            model=model,
+            dataloader=val_loader_submission,
+            device=device,
+            dataset_root=dataset_root,
+            threshold=0.5,
         )
 
         epoch_time = time.time() - start_time
@@ -175,16 +209,21 @@ def main() -> None:
             f"Train Loss: {train_loss:.4f} | "
             f"Train Dice: {train_dice:.4f} | "
             f"Val Loss: {val_loss:.4f} | "
-            f"Val Dice: {val_dice:.4f} | "
+            f"Val Dice (train-space): {val_dice:.4f} | "
+            f"Val Dice (submission-style): {val_submission_dice:.4f} | "
             f"Time: {epoch_time:.1f}s"
         )
 
-        if val_dice > best_val_dice:
-            best_val_dice = val_dice
+        # Save best model based on submission-style validation
+        if val_submission_dice > best_val_submission_dice:
+            best_val_submission_dice = val_submission_dice
             save_checkpoint(model, best_model_path)
             print(f"Saved best model to: {best_model_path}")
 
-    print(f"Training complete. Best Val Dice: {best_val_dice:.4f}")
+    print(
+        f"Training complete. "
+        f"Best Val Dice (submission-style): {best_val_submission_dice:.4f}"
+    )
 
 
 if __name__ == "__main__":

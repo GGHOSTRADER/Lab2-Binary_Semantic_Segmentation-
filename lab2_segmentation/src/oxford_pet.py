@@ -27,6 +27,9 @@ class OxfordPetDataset2015(Dataset):
         image: FloatTensor, shape (3, 572, 572), values in [0, 1]
         mask:  LongTensor,  shape (388, 388), values in {0, 1}
 
+    If return_pet_id=True for train/val/trainval:
+        returns: image, mask, pet_id
+
     Returns for test:
         image: FloatTensor, shape (3, 572, 572), values in [0, 1]
         pet_id: str
@@ -42,6 +45,7 @@ class OxfordPetDataset2015(Dataset):
         val_ratio: float = 0.1,
         seed: int = 42,
         augment: bool = False,
+        return_pet_id: bool = False,
     ) -> None:
         super().__init__()
 
@@ -50,6 +54,7 @@ class OxfordPetDataset2015(Dataset):
         self.val_ratio = val_ratio
         self.seed = seed
         self.augment = augment
+        self.return_pet_id = return_pet_id
 
         self.images_dir = self.root / "images"
         self.annotations_dir = self.root / "annotations"
@@ -233,7 +238,10 @@ class OxfordPetDataset2015(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index: int) -> tuple[Tensor, Tensor] | tuple[Tensor, str]:
+    def __getitem__(
+        self,
+        index: int,
+    ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, str] | tuple[Tensor, str]:
         sample = self.samples[index]
 
         image = self._load_image(sample.image_path)
@@ -253,4 +261,8 @@ class OxfordPetDataset2015(Dataset):
 
         image_tensor = self._image_to_tensor(image)
         mask_tensor = self._mask_to_class_tensor(binary_mask)
+
+        if self.return_pet_id:
+            return image_tensor, mask_tensor, sample.pet_id
+
         return image_tensor, mask_tensor

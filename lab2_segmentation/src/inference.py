@@ -4,7 +4,10 @@ from pathlib import Path
 import csv
 
 import numpy as np
+from PIL import Image
+
 import torch
+import torch.nn.functional as F
 from torch import nn, Tensor
 from torch.utils.data import DataLoader
 
@@ -36,27 +39,80 @@ def mask_to_rle(mask: np.ndarray) -> str:
     return " ".join(str(x) for x in changes)
 
 
-def logits_to_binary_mask(logits: Tensor) -> Tensor:
+def get_original_image_size(
+    dataset_root: str | Path,
+    image_id: str,
+) -> tuple[int, int]:
     """
-    Convert 2-class logits to binary masks.
+    Read the original image size from the raw dataset image.
 
     Args:
-        logits: Tensor of shape (B, 2, H, W)
+        dataset_root: path to dataset/oxford-iiit-pet
+        image_id: stem name such as 'Abyssinian_1'
 
     Returns:
-        Tensor of shape (B, H, W), values in {0, 1}
+        (H, W)
     """
-    if logits.ndim != 4:
+    image_path = Path(dataset_root) / "images" / f"{image_id}.jpg"
+    if not image_path.exists():
+        raise FileNotFoundError(f"Original image not found: {image_path}")
+
+    with Image.open(image_path) as img:
+        width, height = img.size
+
+    return height, width
+
+
+def logits_to_resized_binary_mask(
+    logits_single: Tensor,
+    original_size: tuple[int, int],
+    threshold: float = 0.5,
+) -> np.ndarray:
+    """
+    Convert a single model output from 2-class logits to a binary mask
+    resized back to the original image resolution.
+
+    Args:
+        logits_single: Tensor of shape (2, H_pred, W_pred)
+        original_size: (H_original, W_original)
+        threshold: foreground probability threshold
+
+    Returns:
+        numpy array of shape (H_original, W_original), values in {0, 1}
+    """
+    if logits_single.ndim != 3:
         raise ValueError(
-            f"logits must have shape (B, C, H, W), got {tuple(logits.shape)}"
+            f"logits_single must have shape (C, H, W), got {tuple(logits_single.shape)}"
         )
 
-    if logits.shape[1] != 2:
+    if logits_single.shape[0] != 2:
         raise ValueError(
-            f"Strict 2015 setup expects 2 output channels, got C={logits.shape[1]}"
+            f"Expected 2 output channels for strict 2015 setup, got C={logits_single.shape[0]}"
         )
 
-    return torch.argmax(logits, dim=1)
+    # Convert logits -> foreground probability map
+    probs = torch.softmax(logits_single.unsqueeze(0), dim=1)[:, 1:2, :, :]
+    # Shape: (1, 1, H_pred, W_pred)
+
+    # Resize probability map back to original image size
+    probs_resized = F.interpolate(
+        probs,
+        size=original_size,
+        mode="bilinear",
+        align_corners=False,
+    )
+    # Shape: (1, 1, H_original, W_original)
+
+    binary_mask = (probs_resized > threshold).to(torch.uint8)
+    binary_mask = binary_mask.squeeze(0).squeeze(0).cpu().numpy()
+
+    unique_values = np.unique(binary_mask)
+    if not np.all(np.isin(unique_values, [0, 1])):
+        raise ValueError(
+            f"Resized predicted mask is not binary. Unique values found: {unique_values}"
+        )
+
+    return binary_mask
 
 
 @torch.no_grad()
@@ -64,6 +120,7 @@ def run_inference(
     model: nn.Module,
     dataloader: DataLoader,
     device: torch.device,
+    dataset_root: str | Path,
 ) -> list[tuple[str, str]]:
     """
     Run inference on the test set and return rows:
@@ -72,7 +129,9 @@ def run_inference(
     Strict 2015 RGB assumptions:
     - input images arrive as (B, 3, 572, 572)
     - model outputs logits as (B, 2, 388, 388)
-    - final predicted binary masks are (B, 388, 388)
+
+    Final submission masks are resized back to each image's original
+    dataset resolution before RLE encoding.
     """
     model.eval()
     submission_rows: list[tuple[str, str]] = []
@@ -81,17 +140,14 @@ def run_inference(
         images = images.to(device, non_blocking=True)
 
         logits = model(images)  # (B, 2, 388, 388)
-        pred_masks = logits_to_binary_mask(logits)  # (B, 388, 388)
 
-        for pred_mask, image_id in zip(pred_masks, image_ids):
-            binary_mask = pred_mask.cpu().numpy().astype(np.uint8)
-
-            unique_values = np.unique(binary_mask)
-            if not np.all(np.isin(unique_values, [0, 1])):
-                raise ValueError(
-                    f"Predicted mask for {image_id} is not binary. "
-                    f"Unique values found: {unique_values}"
-                )
+        for sample_logits, image_id in zip(logits, image_ids):
+            original_size = get_original_image_size(dataset_root, image_id)
+            binary_mask = logits_to_resized_binary_mask(
+                sample_logits,
+                original_size=original_size,
+                threshold=0.5,
+            )
 
             encoded_mask = mask_to_rle(binary_mask)
             submission_rows.append((image_id, encoded_mask))
@@ -169,6 +225,7 @@ def main() -> None:
         model=model,
         dataloader=test_loader,
         device=device,
+        dataset_root=dataset_root,
     )
 
     if len(submission_rows) != len(test_loader.dataset):
