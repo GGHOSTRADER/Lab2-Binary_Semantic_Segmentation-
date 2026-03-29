@@ -103,26 +103,26 @@ def simple_padded_probability_map(
 
 
 @torch.no_grad()
-def validate_simple_padded(
+def collect_simple_prob_maps(
     model: nn.Module,
     dataloader: DataLoader,
     device: torch.device,
     dataset_root: str | Path,
-    threshold: float = 0.5,
     input_size: int = 572,
     output_size: int = 388,
-) -> float:
+) -> list[tuple[str, np.ndarray, np.ndarray]]:
     """
-    Standalone validation using:
-        full image -> resize to 572x572 -> 388x388 output ->
-        symmetric pad to 572x572 -> resize to original raw mask size ->
-        threshold -> Dice
+    Precompute resized probability maps and true masks for all validation samples.
+
+    Returns:
+        list of tuples:
+            (pet_id, probs_resized_np, true_mask_np)
+        where both arrays are shape (H_original, W_original)
     """
     model.eval()
-    total_dice = 0.0
-    total_samples = 0
+    cached_results: list[tuple[str, np.ndarray, np.ndarray]] = []
 
-    for images, _, pet_ids in tqdm(dataloader, desc="Simple Kaggle-Style Val"):
+    for images, _, pet_ids in tqdm(dataloader, desc="Caching validation probabilities"):
         images = images.to(device, non_blocking=True)
 
         for i in range(images.shape[0]):
@@ -148,17 +148,29 @@ def validate_simple_padded(
                 1
             )  # (1, H, W)
 
-            pred_mask = (
-                (probs_resized.squeeze(0) > threshold).to(torch.uint8).cpu().numpy()
-            )
+            probs_resized_np = probs_resized.squeeze(0).cpu().numpy()
+            cached_results.append((pet_id, probs_resized_np, true_mask))
 
-            total_dice += dice_score_binary_masks(pred_mask, true_mask)
-            total_samples += 1
-
-    if total_samples == 0:
+    if not cached_results:
         raise ValueError("No validation samples processed.")
 
-    return total_dice / total_samples
+    return cached_results
+
+
+def evaluate_cached_prob_maps(
+    cached_results: list[tuple[str, np.ndarray, np.ndarray]],
+    threshold: float,
+) -> float:
+    """
+    Compute mean Dice for a given threshold using cached probability maps.
+    """
+    total_dice = 0.0
+
+    for _, probs_resized_np, true_mask in cached_results:
+        pred_mask = (probs_resized_np > threshold).astype(np.uint8)
+        total_dice += dice_score_binary_masks(pred_mask, true_mask)
+
+    return total_dice / len(cached_results)
 
 
 def build_val_dataloader(
@@ -201,9 +213,29 @@ def main() -> None:
 
     batch_size = 1
     num_workers = 0
-    threshold = 0.5
     input_size = 572
     output_size = 388
+
+    # Threshold sweep values
+    thresholds = [
+        0.10,
+        0.15,
+        0.20,
+        0.25,
+        0.30,
+        0.35,
+        0.40,
+        0.45,
+        0.50,
+        0.55,
+        0.60,
+        0.65,
+        0.70,
+        0.75,
+        0.80,
+        0.85,
+        0.90,
+    ]
 
     if not dataset_root.exists():
         raise FileNotFoundError(f"Dataset root not found: {dataset_root}")
@@ -220,13 +252,13 @@ def main() -> None:
     print(f"Model path:        {model_path}")
     print(f"Batch size:        {batch_size}")
     print(f"Num workers:       {num_workers}")
-    print(f"Threshold:         {threshold}")
     print(f"Input size:        {input_size}")
     print(f"Output size:       {output_size}")
     print("Normalization:     already applied by val_kaggle dataset")
     print(
         "Strategy:          full image -> resize to 572 -> 388 output -> pad to 572 -> resize to original"
     )
+    print(f"Threshold sweep:   {thresholds}")
     print("=" * 60 + "\n")
 
     val_loader = build_val_dataloader(
@@ -239,17 +271,35 @@ def main() -> None:
 
     model = build_model(device=device, model_path=model_path)
 
-    dice = validate_simple_padded(
+    cached_results = collect_simple_prob_maps(
         model=model,
         dataloader=val_loader,
         device=device,
         dataset_root=dataset_root,
-        threshold=threshold,
         input_size=input_size,
         output_size=output_size,
     )
 
-    print(f"Simple padded Dice on validation set: {dice:.4f}")
+    print("\nThreshold sweep results")
+    print("-" * 40)
+
+    best_threshold = None
+    best_dice = float("-inf")
+
+    for threshold in thresholds:
+        dice = evaluate_cached_prob_maps(
+            cached_results=cached_results,
+            threshold=threshold,
+        )
+        print(f"threshold={threshold:.2f} | dice={dice:.4f}")
+
+        if dice > best_dice:
+            best_dice = dice
+            best_threshold = threshold
+
+    print("-" * 40)
+    print(f"Best threshold: {best_threshold:.2f}")
+    print(f"Best Dice:      {best_dice:.4f}")
 
 
 if __name__ == "__main__":
