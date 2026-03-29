@@ -49,40 +49,28 @@ def simple_padded_probability_map(
     output_size: int = 388,
 ) -> Tensor:
     """
-    Run the model once on a 572x572 validation image, get the 388x388 output,
-    then pad it symmetrically back to 572x572.
-
-    Important:
-    - image is expected to already be normalized by OxfordPetDataset2015(split="val")
-    - no extra normalization is applied here
-
-    Args:
-        model:
-            UNet2015 model.
-        image:
-            Tensor of shape (1, 3, 572, 572), already normalized.
-        input_size:
-            Model input size.
-        output_size:
-            Model valid output size.
-
-    Returns:
-        probs_padded:
-            Tensor of shape (1, 572, 572) with padded foreground probabilities.
+    Full-image simple strategy:
+    - take full normalized image
+    - resize to 572x572
+    - run model once
+    - get 388x388 output
+    - pad back to 572x572
     """
     if image.ndim != 4 or image.shape[0] != 1:
         raise ValueError(f"Expected image shape (1, C, H, W), got {tuple(image.shape)}")
 
-    _, channels, height, width = image.shape
+    _, channels, _, _ = image.shape
     if channels != 3:
         raise ValueError(f"Expected 3 input channels, got {channels}")
-    if height != input_size or width != input_size:
-        raise ValueError(
-            f"Expected spatial size ({input_size}, {input_size}), "
-            f"got ({height}, {width})"
-        )
 
-    logits = model(image)  # (1, 2, 388, 388)
+    image_resized = F.interpolate(
+        image,
+        size=(input_size, input_size),
+        mode="bilinear",
+        align_corners=False,
+    )  # (1, 3, 572, 572)
+
+    logits = model(image_resized)  # (1, 2, 388, 388)
     probs_fg = torch.softmax(logits, dim=1)[:, 1:2, :, :]  # (1, 1, 388, 388)
 
     if probs_fg.shape[-2:] != (output_size, output_size):
@@ -125,10 +113,9 @@ def validate_simple_padded(
 ) -> float:
     """
     Standalone validation using:
-        572x572 image -> 388x388 output -> symmetric pad to 572x572 ->
-        resize to original raw mask size -> threshold -> Dice
-
-    This is intentionally simpler than sliding-window inference.
+        full image -> resize to 572x572 -> 388x388 output ->
+        symmetric pad to 572x572 -> resize to original raw mask size ->
+        threshold -> Dice
     """
     model.eval()
     total_dice = 0.0
@@ -138,7 +125,7 @@ def validate_simple_padded(
         images = images.to(device, non_blocking=True)
 
         for i in range(images.shape[0]):
-            image = images[i : i + 1]  # already normalized, shape (1,3,572,572)
+            image = images[i : i + 1]  # full normalized image from val_kaggle
             pet_id = pet_ids[i]
 
             probs_padded = simple_padded_probability_map(
@@ -152,7 +139,7 @@ def validate_simple_padded(
             original_h, original_w = true_mask.shape
 
             probs_resized = F.interpolate(
-                probs_padded.unsqueeze(1),  # (1,1,572,572)
+                probs_padded.unsqueeze(1),  # (1, 1, 572, 572)
                 size=(original_h, original_w),
                 mode="bilinear",
                 align_corners=False,
@@ -235,8 +222,10 @@ def main() -> None:
     print(f"Threshold:         {threshold}")
     print(f"Input size:        {input_size}")
     print(f"Output size:       {output_size}")
-    print("Normalization:     already applied by val dataset")
-    print("Strategy:          388 output -> pad to 572 -> resize to original")
+    print("Normalization:     already applied by val_kaggle dataset")
+    print(
+        "Strategy:          full image -> resize to 572 -> 388 output -> pad to 572 -> resize to original"
+    )
     print("=" * 60 + "\n")
 
     val_loader = build_val_dataloader(
