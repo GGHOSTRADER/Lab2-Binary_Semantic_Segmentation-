@@ -20,9 +20,9 @@ MODEL_SAVE_PATH = PROJECT_ROOT / "saved_models" / "unet_best_clean.pth"
 # -----------------------------
 # Config
 # -----------------------------
-BATCH_SIZE = 4
-NUM_EPOCHS = 30
-LEARNING_RATE = 1e-3
+BATCH_SIZE = 1
+NUM_EPOCHS = 1
+LEARNING_RATE = 3e-4
 NUM_WORKERS = 0
 PIN_MEMORY = True
 EARLY_STOPPING_PATIENCE = 3
