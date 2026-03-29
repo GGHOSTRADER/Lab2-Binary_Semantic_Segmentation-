@@ -4,3 +4,4 @@ saved_models/*.pth
 dataset/oxford-iiit-pet/images/
 dataset/oxford-iiit-pet/annotations/
 src/imagine_check.py
+lab2_segmentation/submissions/

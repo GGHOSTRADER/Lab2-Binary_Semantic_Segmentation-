@@ -295,12 +295,8 @@ class OxfordPetDataset2015(Dataset):
         return image_t, mask_t
 
     def _apply_test_image_transform(self, image: Image.Image) -> Tensor:
-        image = TF.resize(
-            image,
-            self.INPUT_SIZE,
-            interpolation=InterpolationMode.BILINEAR,
-        )
-        return TF.to_tensor(image)
+        
+        return TF.to_tensor(image)  # shape: (3, H_original, W_original)
 
     @staticmethod
     def _mask_to_class_tensor(mask_t: Tensor) -> Tensor:

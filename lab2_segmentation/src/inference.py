@@ -17,16 +17,7 @@ from utils import get_device, load_checkpoint
 
 
 def mask_to_rle(mask: np.ndarray) -> str:
-    """
-    Convert a binary mask to Run-Length Encoding (RLE) in column-major
-    (Fortran) order.
-
-    Args:
-        mask: numpy array of shape (H, W), values in {0, 1}
-
-    Returns:
-        RLE string
-    """
+    """Convert a binary mask to Run-Length Encoding (RLE) in column-major order."""
     if mask.ndim != 2:
         raise ValueError(f"mask must be 2D, got shape={mask.shape}")
 
@@ -39,20 +30,8 @@ def mask_to_rle(mask: np.ndarray) -> str:
     return " ".join(str(x) for x in changes)
 
 
-def get_original_image_size(
-    dataset_root: str | Path,
-    image_id: str,
-) -> tuple[int, int]:
-    """
-    Read the original image size from the raw dataset image.
-
-    Args:
-        dataset_root: path to dataset/oxford-iiit-pet
-        image_id: stem name such as 'Abyssinian_1'
-
-    Returns:
-        (H, W)
-    """
+def get_original_image_size(dataset_root: str | Path, image_id: str) -> tuple[int, int]:
+    """Read the original image size from the raw dataset image."""
     image_path = Path(dataset_root) / "images" / f"{image_id}.jpg"
     if not image_path.exists():
         raise FileNotFoundError(f"Original image not found: {image_path}")
@@ -63,54 +42,57 @@ def get_original_image_size(
     return height, width
 
 
-def logits_to_resized_binary_mask(
-    logits_single: Tensor,
-    original_size: tuple[int, int],
-    threshold: float = 0.5,
-) -> np.ndarray:
+@torch.no_grad()
+def sliding_window_inference(
+    model: nn.Module,
+    image: Tensor,
+    patch_size: int = 572,
+    stride: int = 388,
+    device: torch.device = torch.device("cpu"),
+) -> Tensor:
     """
-    Convert a single model output from 2-class logits to a binary mask
-    resized back to the original image resolution.
+    Perform sliding-window inference on a single image tensor.
 
     Args:
-        logits_single: Tensor of shape (2, H_pred, W_pred)
-        original_size: (H_original, W_original)
-        threshold: foreground probability threshold
+        model: UNet2015 model.
+        image: Tensor of shape (1, 3, H, W) in original resolution.
+        patch_size: patch size to feed the U-Net.
+        stride: stride for sliding window (overlap = patch_size - stride).
+        device: torch device.
 
     Returns:
-        numpy array of shape (H_original, W_original), values in {0, 1}
+        full_probs: Tensor of shape (1, H, W) with probabilities in [0,1].
     """
-    if logits_single.ndim != 3:
-        raise ValueError(
-            f"logits_single must have shape (C, H, W), got {tuple(logits_single.shape)}"
-        )
+    _, _, H, W = image.shape
+    full_probs = torch.zeros((1, H, W), dtype=torch.float32, device=device)
+    count_map = torch.zeros((1, H, W), dtype=torch.float32, device=device)
 
-    if logits_single.shape[0] != 2:
-        raise ValueError(
-            f"Expected 2 output channels for strict 2015 setup, got C={logits_single.shape[0]}"
-        )
+    for y in range(0, H, stride):
+        for x in range(0, W, stride):
+            y1 = y
+            x1 = x
+            y2 = min(y + patch_size, H)
+            x2 = min(x + patch_size, W)
+            patch = image[:, :, y1:y2, x1:x2]
 
-    probs = torch.softmax(logits_single.unsqueeze(0), dim=1)[:, 1:2, :, :]
-    # Shape: (1, 1, H_pred, W_pred)
+            # pad if patch is smaller than patch_size
+            pad_bottom = patch_size - patch.shape[2]
+            pad_right = patch_size - patch.shape[3]
+            if pad_bottom > 0 or pad_right > 0:
+                patch = F.pad(patch, (0, pad_right, 0, pad_bottom))
 
-    probs_resized = F.interpolate(
-        probs,
-        size=original_size,
-        mode="bilinear",
-        align_corners=False,
-    )
-    # Shape: (1, 1, H_original, W_original)
+            logits_patch = model(patch.to(device))  # (1,2,388,388)
+            probs_patch = torch.softmax(logits_patch, dim=1)[:, 1:2, :, :]
 
-    binary_mask = (probs_resized > threshold).to(torch.uint8)
-    binary_mask = binary_mask.squeeze(0).squeeze(0).cpu().numpy()
+            # crop back to the patch size (in case padding was added)
+            probs_patch = probs_patch[:, :, : y2 - y1, : x2 - x1]
 
-    unique_values = np.unique(binary_mask)
-    if not np.all(np.isin(unique_values, [0, 1])):
-        raise ValueError(
-            f"Resized predicted mask is not binary. Unique values found: {unique_values}"
-        )
+            # add to full_probs
+            full_probs[:, y1:y2, x1:x2] += probs_patch
+            count_map[:, y1:y2, x1:x2] += 1
 
-    return binary_mask
+    full_probs /= count_map
+    return full_probs
 
 
 @torch.no_grad()
@@ -122,15 +104,7 @@ def run_inference(
     threshold: float = 0.5,
 ) -> list[tuple[str, str]]:
     """
-    Run inference on the test set and return rows:
-    [(image_id, encoded_mask), ...]
-
-    Strict 2015 RGB assumptions:
-    - input images arrive as (B, 3, 572, 572)
-    - model outputs logits as (B, 2, 388, 388)
-
-    Final submission masks are resized back to each image's original
-    dataset resolution before RLE encoding.
+    Run sliding-window inference on the test set.
     """
     model.eval()
     submission_rows: list[tuple[str, str]] = []
@@ -138,44 +112,36 @@ def run_inference(
     for images, image_ids in dataloader:
         images = images.to(device, non_blocking=True)
 
-        logits = model(images)  # (B, 2, 388, 388)
+        for i in range(images.shape[0]):
+            image = images[i : i + 1, :, :, :]  # (1,3,H,W)
+            original_size = get_original_image_size(dataset_root, image_ids[i])
+            full_probs = sliding_window_inference(model, image, device=device)
 
-        for sample_logits, image_id in zip(logits, image_ids):
-            original_size = get_original_image_size(dataset_root, image_id)
-            binary_mask = logits_to_resized_binary_mask(
-                sample_logits,
-                original_size=original_size,
-                threshold=threshold,
-            )
+            # resize to original image size
+            full_probs_resized = F.interpolate(
+                full_probs.unsqueeze(0),
+                size=original_size,
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
 
+            binary_mask = (full_probs_resized > threshold).to(torch.uint8).cpu().numpy()
             encoded_mask = mask_to_rle(binary_mask)
-            submission_rows.append((image_id, encoded_mask))
+            submission_rows.append((image_ids[i], encoded_mask))
 
     return submission_rows
 
 
-def save_submission_csv(
-    rows: list[tuple[str, str]],
-    save_path: str | Path,
-) -> None:
-    """
-    Save Kaggle submission CSV with columns:
-    image_id, encoded_mask
-    """
+def save_submission_csv(rows: list[tuple[str, str]], save_path: str | Path) -> None:
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
-
     with save_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["image_id", "encoded_mask"])
         writer.writerows(rows)
 
 
-def build_test_dataloader(
-    dataset_root: str | Path,
-    batch_size: int,
-    num_workers: int,
-) -> DataLoader:
+def build_test_dataloader(dataset_root: str | Path, batch_size: int, num_workers: int) -> DataLoader:
     test_dataset = OxfordPetDataset2015(
         root=dataset_root,
         split="test",
@@ -207,12 +173,12 @@ def build_model(device: torch.device, model_path: str | Path) -> nn.Module:
 
 def main() -> None:
     dataset_root = "dataset/oxford-iiit-pet"
-    batch_size = 8
+    batch_size = 1  # sliding window works better with batch_size=1
     num_workers = 0
     threshold = 0.5
 
     model_path = "saved_models/unet2015_rgb_best.pth"
-    submission_path = "submissions/unet2015_rgb_submission.csv"
+    submission_path = "submissions/unet2015_rgb_sliding_window.csv"
 
     device = get_device()
     print(f"Using device: {device}")
