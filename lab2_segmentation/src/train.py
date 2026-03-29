@@ -149,10 +149,11 @@ def main() -> None:
     batch_size = 1
     num_epochs = 30
     learning_rate = 1e-4
-    num_workers = 4
+    num_workers = 0
 
-    early_stopping_patience = 5
+    early_stopping_patience = 4
     min_delta = 1e-4
+    submission_eval_every = 4
 
     model_save_dir = ensure_dir("saved_models")
     best_model_path = model_save_dir / "unet2015_rgb_best.pth"
@@ -179,6 +180,7 @@ def main() -> None:
 
     best_val_submission_dice = -1.0
     epochs_without_improvement = 0
+    last_val_submission_dice = float("nan")
 
     # -----------------------------
     # Training loop
@@ -201,13 +203,21 @@ def main() -> None:
             device=device,
         )
 
-        val_submission_dice = validate_submission_style(
-            model=model,
-            dataloader=val_loader_submission,
-            device=device,
-            dataset_root=dataset_root,
-            threshold=0.5,
-        )
+        ran_submission_eval = (epoch == 1) or (epoch % submission_eval_every == 0)
+
+        if ran_submission_eval:
+            val_submission_dice = validate_submission_style(
+                model=model,
+                dataloader=val_loader_submission,
+                device=device,
+                dataset_root=dataset_root,
+                threshold=0.5,
+            )
+            last_val_submission_dice = val_submission_dice
+            submission_text = f"{val_submission_dice:.4f}"
+        else:
+            val_submission_dice = last_val_submission_dice
+            submission_text = "skipped"
 
         epoch_time = time.time() - start_time
 
@@ -217,28 +227,29 @@ def main() -> None:
             f"Train Dice: {train_dice:.4f} | "
             f"Val Loss: {val_loss:.4f} | "
             f"Val Dice (train-space): {val_dice:.4f} | "
-            f"Val Dice (submission-style): {val_submission_dice:.4f} | "
+            f"Val Dice (submission-style): {submission_text} | "
             f"Time: {epoch_time:.1f}s"
         )
 
-        if val_submission_dice > best_val_submission_dice + min_delta:
-            best_val_submission_dice = val_submission_dice
-            epochs_without_improvement = 0
-            save_checkpoint(model, best_model_path)
-            print(f"Saved best model to: {best_model_path}")
-        else:
-            epochs_without_improvement += 1
-            print(
-                f"No submission-style val improvement for "
-                f"{epochs_without_improvement} epoch(s)."
-            )
+        if ran_submission_eval:
+            if val_submission_dice > best_val_submission_dice + min_delta:
+                best_val_submission_dice = val_submission_dice
+                epochs_without_improvement = 0
+                save_checkpoint(model, best_model_path)
+                print(f"Saved best model to: {best_model_path}")
+            else:
+                epochs_without_improvement += 1
+                print(
+                    f"No submission-style val improvement for "
+                    f"{epochs_without_improvement} submission check(s)."
+                )
 
-        if epochs_without_improvement >= early_stopping_patience:
-            print(
-                f"Early stopping triggered at epoch {epoch}. "
-                f"Best Val Dice (submission-style): {best_val_submission_dice:.4f}"
-            )
-            break
+            if epochs_without_improvement >= early_stopping_patience:
+                print(
+                    f"Early stopping triggered at epoch {epoch}. "
+                    f"Best Val Dice (submission-style): {best_val_submission_dice:.4f}"
+                )
+                break
 
     print(
         f"Training complete. "
