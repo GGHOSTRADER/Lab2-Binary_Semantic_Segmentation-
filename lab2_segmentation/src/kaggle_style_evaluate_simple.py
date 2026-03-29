@@ -180,7 +180,7 @@ def build_val_dataloader(
 ) -> DataLoader:
     val_dataset = OxfordPetDataset2015(
         root=dataset_root,
-        split="val",
+        split="val_kaggle",
         augment=False,
         return_pet_id=True,
     )
