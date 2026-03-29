@@ -1,12 +1,12 @@
-# inference.py
+# inference_simple.py
 from __future__ import annotations
 
 from pathlib import Path
 import csv
-import math
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn, Tensor
 from torch.utils.data import DataLoader
 
@@ -46,114 +46,86 @@ def build_normalization_tensors(device: torch.device) -> tuple[Tensor, Tensor]:
 
 
 @torch.no_grad()
-def sliding_window_inference(
+def simple_inference_probability_map(
     model: nn.Module,
     image: Tensor,
     mean: Tensor,
     std: Tensor,
-    patch_size: int = 572,
+    input_size: int = 572,
     output_size: int = 388,
 ) -> Tensor:
     """
-    Perform overlap-tile inference for the original 2015 U-Net.
-
-    Model geometry:
-        input patch  = 572 x 572
-        output patch = 388 x 388
-
-    The output corresponds only to the CENTER of the input patch.
-    Therefore, we tile the final prediction using 388x388 output tiles,
-    while feeding 572x572 context patches to the model.
+    Simple inference strategy:
+    - take full unnormalized image in [0,1]
+    - resize to 572x572
+    - normalize
+    - run model once
+    - get 388x388 foreground probs
+    - pad back to 572x572
 
     Args:
         model:
             UNet2015 model.
         image:
-            Tensor of shape (1, 3, H, W), already on the target device.
-            Expected value range: [0, 1] before normalization.
+            Tensor of shape (1, 3, H, W), values in [0,1].
         mean:
-            Normalization mean tensor of shape (1, 3, 1, 1).
+            Normalization mean tensor, shape (1, 3, 1, 1).
         std:
-            Normalization std tensor of shape (1, 3, 1, 1).
-        patch_size:
-            Input patch size for the model. For original U-Net: 572.
+            Normalization std tensor, shape (1, 3, 1, 1).
+        input_size:
+            Model input size.
         output_size:
-            Valid output tile size from the model. For original U-Net: 388.
+            Model output size.
 
     Returns:
-        probs:
-            Tensor of shape (1, H, W), foreground probabilities in [0, 1].
+        probs_padded:
+            Tensor of shape (1, 572, 572).
     """
     if image.ndim != 4 or image.shape[0] != 1:
         raise ValueError(f"Expected image shape (1, C, H, W), got {tuple(image.shape)}")
 
-    _, channels, height, width = image.shape
-
+    _, channels, _, _ = image.shape
     if channels != 3:
         raise ValueError(f"Expected 3 input channels, got {channels}")
 
-    margin = (patch_size - output_size) // 2
-    if margin < 0:
+    image_resized = F.interpolate(
+        image,
+        size=(input_size, input_size),
+        mode="bilinear",
+        align_corners=False,
+    )  # (1, 3, 572, 572)
+
+    image_resized = (image_resized - mean) / std
+
+    logits = model(image_resized)  # (1, 2, 388, 388)
+    probs_fg = torch.softmax(logits, dim=1)[:, 1:2, :, :]  # (1, 1, 388, 388)
+
+    if probs_fg.shape[-2:] != (output_size, output_size):
         raise ValueError(
-            f"Invalid sizes: patch_size={patch_size}, output_size={output_size}"
+            f"Expected output size ({output_size}, {output_size}), "
+            f"got {tuple(probs_fg.shape[-2:])}"
         )
 
-    tiles_y = math.ceil(height / output_size)
-    tiles_x = math.ceil(width / output_size)
+    total_pad = input_size - output_size
+    if total_pad < 0:
+        raise ValueError(
+            f"Invalid sizes: input_size={input_size}, output_size={output_size}"
+        )
 
-    padded_height = tiles_y * output_size + 2 * margin
-    padded_width = tiles_x * output_size + 2 * margin
+    pad_each_side = total_pad // 2
+    if total_pad % 2 != 0:
+        raise ValueError(
+            f"Expected even padding difference, got input_size - output_size = {total_pad}"
+        )
 
-    padded_image = torch.zeros(
-        (1, channels, padded_height, padded_width),
-        dtype=image.dtype,
-        device=image.device,
-    )
-    padded_image[:, :, margin : margin + height, margin : margin + width] = image
+    probs_padded = F.pad(
+        probs_fg,
+        pad=(pad_each_side, pad_each_side, pad_each_side, pad_each_side),
+        mode="constant",
+        value=0.0,
+    )  # (1, 1, 572, 572)
 
-    full_probs = torch.zeros(
-        (1, tiles_y * output_size, tiles_x * output_size),
-        dtype=torch.float32,
-        device=image.device,
-    )
-
-    for y_out in range(0, tiles_y * output_size, output_size):
-        for x_out in range(0, tiles_x * output_size, output_size):
-            patch = padded_image[
-                :,
-                :,
-                y_out : y_out + patch_size,
-                x_out : x_out + patch_size,
-            ]
-
-            if patch.shape[-2:] != (patch_size, patch_size):
-                raise ValueError(
-                    f"Patch shape mismatch: got {tuple(patch.shape)}, "
-                    f"expected spatial size {(patch_size, patch_size)}"
-                )
-
-            # Normalize per patch to match training
-            patch = (patch - mean) / std
-
-            logits_patch = model(patch)  # (1, 2, 388, 388)
-            probs_patch = torch.softmax(logits_patch, dim=1)[
-                :, 1, :, :
-            ]  # (1, 388, 388)
-
-            if probs_patch.shape[-2:] != (output_size, output_size):
-                raise ValueError(
-                    f"Output tile shape mismatch: got {tuple(probs_patch.shape)}, "
-                    f"expected spatial size {(output_size, output_size)}"
-                )
-
-            full_probs[
-                :,
-                y_out : y_out + output_size,
-                x_out : x_out + output_size,
-            ] = probs_patch
-
-    full_probs = full_probs[:, :height, :width]
-    return full_probs
+    return probs_padded.squeeze(1)  # (1, 572, 572)
 
 
 @torch.no_grad()
@@ -162,14 +134,15 @@ def run_inference(
     dataloader: DataLoader,
     device: torch.device,
     threshold: float = 0.5,
-    patch_size: int = 572,
+    input_size: int = 572,
     output_size: int = 388,
 ) -> list[tuple[str, str]]:
     """
-    Run overlap-tile inference on the test set and return submission rows.
+    Run simple one-shot inference on the test set and return submission rows.
 
-    Returns:
-        list of (image_id, encoded_mask)
+    Strategy:
+        full image -> resize to 572 -> normalize -> model ->
+        388 output -> pad to 572 -> resize to original -> threshold -> RLE
     """
     model.eval()
     submission_rows: list[tuple[str, str]] = []
@@ -180,23 +153,35 @@ def run_inference(
         images = images.to(device, non_blocking=True)
 
         for i in range(images.shape[0]):
-            image = images[i : i + 1]  # (1, 3, H, W)
+            image = images[i : i + 1]  # (1, 3, H, W), full image, unnormalized
             image_id = image_ids[i]
 
-            full_probs = sliding_window_inference(
+            original_h = image.shape[-2]
+            original_w = image.shape[-1]
+
+            probs_padded = simple_inference_probability_map(
                 model=model,
                 image=image,
                 mean=mean,
                 std=std,
-                patch_size=patch_size,
+                input_size=input_size,
                 output_size=output_size,
+            )  # (1, 572, 572)
+
+            probs_resized = F.interpolate(
+                probs_padded.unsqueeze(1),  # (1, 1, 572, 572)
+                size=(original_h, original_w),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(
+                1
             )  # (1, H, W)
 
             binary_mask = (
-                (full_probs.squeeze(0) > threshold).to(torch.uint8).cpu().numpy()
-            )
-            encoded_mask = mask_to_rle(binary_mask)
+                (probs_resized.squeeze(0) > threshold).to(torch.uint8).cpu().numpy()
+            )  # (H, W)
 
+            encoded_mask = mask_to_rle(binary_mask)
             submission_rows.append((image_id, encoded_mask))
 
     return submission_rows
@@ -249,12 +234,12 @@ def main() -> None:
     project_root = Path(__file__).resolve().parents[1]
     dataset_root = project_root / "dataset" / "oxford-iiit-pet"
     model_path = project_root / "saved_models" / "unet_best_clean.pth"
-    submission_path = project_root / "submissions" / "unet2015_rgb_sliding_window.csv"
+    submission_path = project_root / "submissions" / "unet2015_rgb_simple.csv"
 
     batch_size = 1
     num_workers = 0
     threshold = 0.5
-    patch_size = 572
+    input_size = 572
     output_size = 388
 
     if not dataset_root.exists():
@@ -265,7 +250,7 @@ def main() -> None:
     device = get_device()
 
     print("\n" + "=" * 60)
-    print("INFERENCE CONFIGURATION")
+    print("SIMPLE INFERENCE CONFIGURATION")
     print("=" * 60)
     print(f"Device:            {device}")
     print(f"Dataset root:      {dataset_root}")
@@ -274,9 +259,12 @@ def main() -> None:
     print(f"Batch size:        {batch_size}")
     print(f"Num workers:       {num_workers}")
     print(f"Threshold:         {threshold}")
-    print(f"Patch size:        {patch_size}")
+    print(f"Input size:        {input_size}")
     print(f"Output size:       {output_size}")
     print(f"Normalization:     mean={NORM_MEAN}, std={NORM_STD}")
+    print(
+        "Strategy:          full image -> resize to 572 -> 388 output -> pad to 572 -> resize to original"
+    )
     print("=" * 60 + "\n")
 
     test_loader = build_test_dataloader(
@@ -294,7 +282,7 @@ def main() -> None:
         dataloader=test_loader,
         device=device,
         threshold=threshold,
-        patch_size=patch_size,
+        input_size=input_size,
         output_size=output_size,
     )
 
