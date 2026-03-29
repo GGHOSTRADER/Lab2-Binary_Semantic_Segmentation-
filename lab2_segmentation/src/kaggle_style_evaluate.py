@@ -15,17 +15,6 @@ from models.unet import UNet2015
 from utils import get_device, load_checkpoint
 
 
-# Must match training / inference normalization
-NORM_MEAN = [0.485, 0.456, 0.406]
-NORM_STD = [0.229, 0.224, 0.225]
-
-
-def build_normalization_tensors(device: torch.device) -> tuple[Tensor, Tensor]:
-    mean = torch.tensor(NORM_MEAN, dtype=torch.float32, device=device).view(1, 3, 1, 1)
-    std = torch.tensor(NORM_STD, dtype=torch.float32, device=device).view(1, 3, 1, 1)
-    return mean, std
-
-
 def load_original_binary_mask(dataset_root: str | Path, pet_id: str) -> np.ndarray:
     mask_path = Path(dataset_root) / "annotations" / "trimaps" / f"{pet_id}.png"
     if not mask_path.exists():
@@ -56,30 +45,15 @@ def dice_score_binary_masks(
 def sliding_window_probability_map(
     model: nn.Module,
     image: Tensor,
-    mean: Tensor,
-    std: Tensor,
     patch_size: int = 572,
     output_size: int = 388,
 ) -> Tensor:
     """
     True overlap-tile inference for original U-Net.
 
-    Args:
-        model:
-            UNet2015 model.
-        image:
-            Tensor of shape (1, 3, H, W), already on device, values in [0,1].
-        mean:
-            Normalization mean tensor of shape (1, 3, 1, 1).
-        std:
-            Normalization std tensor of shape (1, 3, 1, 1).
-        patch_size:
-            Input patch size for the model.
-        output_size:
-            Valid output tile size for the model.
-
-    Returns:
-        Tensor of shape (1, H, W) with foreground probabilities.
+    Important for this validation script:
+    - `image` already comes normalized from OxfordPetDataset2015(split="val")
+    - so DO NOT normalize again here
     """
     if image.ndim != 4 or image.shape[0] != 1:
         raise ValueError(f"Expected image shape (1, C, H, W), got {tuple(image.shape)}")
@@ -129,8 +103,6 @@ def sliding_window_probability_map(
                     f"expected spatial size {(patch_size, patch_size)}"
                 )
 
-            patch = (patch - mean) / std
-
             logits_patch = model(patch)  # (1, 2, 388, 388)
             probs_patch = torch.softmax(logits_patch, dim=1)[
                 :, 1, :, :
@@ -165,27 +137,23 @@ def validate_sliding_window(
     """
     Standalone sliding-window validation.
 
-    Uses the validation images from OxfordPetDataset2015 and compares
-    predictions against the original raw trimap-derived binary masks.
+    Uses validation images from OxfordPetDataset2015(split="val") and compares
+    predictions against original raw trimap-derived binary masks.
     """
     model.eval()
     total_dice = 0.0
     total_samples = 0
 
-    mean, std = build_normalization_tensors(device)
-
     for images, _, pet_ids in tqdm(dataloader, desc="Sliding Window Val"):
         images = images.to(device, non_blocking=True)
 
         for i in range(images.shape[0]):
-            image = images[i : i + 1]  # (1, 3, H, W)
+            image = images[i : i + 1]  # already normalized
             pet_id = pet_ids[i]
 
             probs = sliding_window_probability_map(
                 model=model,
                 image=image,
-                mean=mean,
-                std=std,
                 patch_size=patch_size,
                 output_size=output_size,
             )
@@ -272,7 +240,7 @@ def main() -> None:
     print(f"Threshold:         {threshold}")
     print(f"Patch size:        {patch_size}")
     print(f"Output size:       {output_size}")
-    print(f"Normalization:     mean={NORM_MEAN}, std={NORM_STD}")
+    print("Normalization:     already applied by val dataset")
     print("=" * 60 + "\n")
 
     val_loader = build_val_dataloader(
