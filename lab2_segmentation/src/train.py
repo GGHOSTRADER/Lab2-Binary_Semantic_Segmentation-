@@ -20,11 +20,12 @@ MODEL_SAVE_PATH = PROJECT_ROOT / "saved_models" / "unet_best_clean.pth"
 # -----------------------------
 # Config
 # -----------------------------
-BATCH_SIZE = 1
+BATCH_SIZE = 4
 NUM_EPOCHS = 30
 LEARNING_RATE = 1e-3
-NUM_WORKERS = 0  #
-PIN_MEMORY = True  #
+NUM_WORKERS = 0
+PIN_MEMORY = True
+EARLY_STOPPING_PATIENCE = 3
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # -----------------------------
@@ -68,8 +69,10 @@ print(f"Device:            {DEVICE}")
 print(f"Batch size:        {BATCH_SIZE}")
 print(f"Epochs:            {NUM_EPOCHS}")
 print(f"Learning rate:     {LEARNING_RATE}")
-print(f"Num workers:       {NUM_WORKERS}")  #
-print(f"Pin memory:        {PIN_MEMORY}")  #
+print(f"Num workers:       {NUM_WORKERS}")
+print(f"Pin memory:        {PIN_MEMORY}")
+print(f"Early stopping:    True")
+print(f"Patience:          {EARLY_STOPPING_PATIENCE}")
 
 print("\nPaths:")
 print(f"Project root:      {PROJECT_ROOT}")
@@ -99,11 +102,19 @@ criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
 # -----------------------------
+# Early Stopping State
+# -----------------------------
+best_val_dice = float("-inf")
+best_epoch = 0
+epochs_without_improvement = 0
+
+# -----------------------------
 # Training Loop
 # -----------------------------
 for epoch in range(NUM_EPOCHS):
     model.train()
     running_loss = 0.0
+    num_train_batches = 0
 
     progress_bar = tqdm(
         train_loader,
@@ -122,7 +133,8 @@ for epoch in range(NUM_EPOCHS):
         optimizer.step()
 
         running_loss += loss.item()
-        progress_bar.set_postfix({"loss": f"{running_loss / (progress_bar.n + 1):.4f}"})
+        num_train_batches += 1
+        progress_bar.set_postfix({"loss": f"{running_loss / num_train_batches:.4f}"})
 
     avg_train_loss = running_loss / len(train_loader)
 
@@ -135,8 +147,34 @@ for epoch in range(NUM_EPOCHS):
         f"Val Dice: {val_dice:.4f}"
     )
 
-# -----------------------------
-# Save final model
-# -----------------------------
-torch.save(model.state_dict(), MODEL_SAVE_PATH)
-print(f"Training complete. Model saved to {MODEL_SAVE_PATH}")
+    # -----------------------------
+    # Save best model + Early stopping
+    # -----------------------------
+    if val_dice > best_val_dice:
+        best_val_dice = val_dice
+        best_epoch = epoch + 1
+        epochs_without_improvement = 0
+
+        torch.save(model.state_dict(), MODEL_SAVE_PATH)
+        print(
+            f"Saved new best model to {MODEL_SAVE_PATH} "
+            f"(epoch {best_epoch}, val_dice={best_val_dice:.4f})"
+        )
+    else:
+        epochs_without_improvement += 1
+        print(
+            f"No improvement for {epochs_without_improvement} epoch(s). "
+            f"Best val_dice={best_val_dice:.4f} at epoch {best_epoch}."
+        )
+
+        if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
+            print(
+                f"Early stopping triggered after {EARLY_STOPPING_PATIENCE} "
+                f"epoch(s) without improvement."
+            )
+            break
+
+print(
+    f"Training complete. Best model was saved to {MODEL_SAVE_PATH} "
+    f"(epoch {best_epoch}, val_dice={best_val_dice:.4f})"
+)
