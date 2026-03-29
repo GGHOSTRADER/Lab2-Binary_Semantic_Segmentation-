@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import random
 
 import numpy as np
 from PIL import Image
@@ -10,7 +11,7 @@ import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 import torchvision.transforms.functional as TF
-from torchvision.transforms import InterpolationMode
+from torchvision.transforms import InterpolationMode, ColorJitter
 from torchvision.transforms.functional import gaussian_blur
 
 
@@ -31,19 +32,23 @@ class OxfordPetDataset2015(Dataset):
         - test_kaggle_unet.txt
 
     Returns for train/val:
-        image: FloatTensor, shape (3, 572, 572), values in [0, 1]
+        image: FloatTensor, shape (3, 572, 572), normalized
         mask:  LongTensor,  shape (388, 388), values in {0, 1}
 
     If return_pet_id=True for train/val:
         returns: image, mask, pet_id
 
     Returns for test:
-        image: FloatTensor, shape (3, 572, 572), values in [0, 1]
+        image: FloatTensor, shape (3, H_original, W_original), values in [0, 1]
         pet_id: str
     """
 
     INPUT_SIZE = (572, 572)
     TARGET_SIZE = (388, 388)
+
+    # Must match inference normalization
+    NORM_MEAN = [0.485, 0.456, 0.406]
+    NORM_STD = [0.229, 0.224, 0.225]
 
     def __init__(
         self,
@@ -51,8 +56,15 @@ class OxfordPetDataset2015(Dataset):
         split: str = "train",
         augment: bool = False,
         return_pet_id: bool = False,
-        elastic_alpha: float = 34.0,
+        elastic_alpha: float = 8.0,
         elastic_sigma: float = 4.0,
+        min_scale_jitter: float = 0.90,
+        max_scale_jitter: float = 1.10,
+        rotation_degrees: float = 10.0,
+        color_jitter_brightness: float = 0.15,
+        color_jitter_contrast: float = 0.15,
+        color_jitter_saturation: float = 0.10,
+        color_jitter_hue: float = 0.03,
     ) -> None:
         super().__init__()
 
@@ -60,8 +72,19 @@ class OxfordPetDataset2015(Dataset):
         self.split = split
         self.augment = augment
         self.return_pet_id = return_pet_id
+
         self.elastic_alpha = elastic_alpha
         self.elastic_sigma = elastic_sigma
+        self.min_scale_jitter = min_scale_jitter
+        self.max_scale_jitter = max_scale_jitter
+        self.rotation_degrees = rotation_degrees
+
+        self.color_jitter = ColorJitter(
+            brightness=color_jitter_brightness,
+            contrast=color_jitter_contrast,
+            saturation=color_jitter_saturation,
+            hue=color_jitter_hue,
+        )
 
         self.images_dir = self.root / "images"
         self.annotations_dir = self.root / "annotations"
@@ -187,6 +210,57 @@ class OxfordPetDataset2015(Dataset):
         left = (w - target_w) // 2
         return x[:, top : top + target_h, left : left + target_w]
 
+    @staticmethod
+    def _pad_if_needed(
+        image_t: Tensor,
+        mask_t: Tensor,
+        min_height: int,
+        min_width: int,
+    ) -> tuple[Tensor, Tensor]:
+        """
+        Pad on the bottom/right if the tensor is slightly too small for cropping.
+        Safety net after resize / rotation rounding.
+        """
+        _, h, w = image_t.shape
+        pad_h = max(0, min_height - h)
+        pad_w = max(0, min_width - w)
+
+        if pad_h == 0 and pad_w == 0:
+            return image_t, mask_t
+
+        image_t = TF.pad(image_t, [0, 0, pad_w, pad_h], fill=0.0)
+        mask_t = TF.pad(mask_t, [0, 0, pad_w, pad_h], fill=0.0)
+        return image_t, mask_t
+
+    @staticmethod
+    def _aspect_ratio_resize_pil(
+        image: Image.Image,
+        mask: Image.Image,
+        target_short_side: int,
+    ) -> tuple[Image.Image, Image.Image]:
+        """
+        Resize image + mask so that the shorter side becomes target_short_side,
+        preserving aspect ratio.
+        """
+        w, h = image.size
+        short_side = min(h, w)
+        scale = target_short_side / short_side
+
+        new_h = int(round(h * scale))
+        new_w = int(round(w * scale))
+
+        image = TF.resize(
+            image,
+            [new_h, new_w],
+            interpolation=InterpolationMode.BILINEAR,
+        )
+        mask = TF.resize(
+            mask,
+            [new_h, new_w],
+            interpolation=InterpolationMode.NEAREST,
+        )
+        return image, mask
+
     def _sample_displacement(
         self, height: int, width: int, device: torch.device
     ) -> Tensor:
@@ -220,46 +294,121 @@ class OxfordPetDataset2015(Dataset):
         displacement = torch.stack((dx.squeeze(0), dy.squeeze(0)), dim=-1).unsqueeze(0)
         return displacement
 
+    @staticmethod
+    def _random_crop_pair(
+        image_t: Tensor,
+        mask_t: Tensor,
+        output_size: tuple[int, int],
+    ) -> tuple[Tensor, Tensor]:
+        crop_h, crop_w = output_size
+        _, h, w = image_t.shape
+
+        if crop_h > h or crop_w > w:
+            raise ValueError(f"Cannot random crop {(h, w)} to {(crop_h, crop_w)}")
+
+        top = 0 if h == crop_h else random.randint(0, h - crop_h)
+        left = 0 if w == crop_w else random.randint(0, w - crop_w)
+
+        image_t = image_t[:, top : top + crop_h, left : left + crop_w]
+        mask_t = mask_t[:, top : top + crop_h, left : left + crop_w]
+        return image_t, mask_t
+
+    @staticmethod
+    def _center_crop_pair(
+        image_t: Tensor,
+        mask_t: Tensor,
+        output_size: tuple[int, int],
+    ) -> tuple[Tensor, Tensor]:
+        crop_h, crop_w = output_size
+        _, h, w = image_t.shape
+
+        if crop_h > h or crop_w > w:
+            raise ValueError(f"Cannot center crop {(h, w)} to {(crop_h, crop_w)}")
+
+        top = (h - crop_h) // 2
+        left = (w - crop_w) // 2
+
+        image_t = image_t[:, top : top + crop_h, left : left + crop_w]
+        mask_t = mask_t[:, top : top + crop_h, left : left + crop_w]
+        return image_t, mask_t
+
     def _apply_joint_transforms(
         self,
         image: Image.Image,
         mask: Image.Image,
     ) -> tuple[Tensor, Tensor]:
         """
-        Apply identical spatial transforms to image and mask.
+        Train:
+            1) aspect-ratio-preserving resize with mild scale jitter
+            2) random crop to 572x572
+            3) hflip
+            4) small rotation
+            5) small elastic deformation
+            6) color jitter on image only
+            7) normalize image
+            8) center-crop mask to 388x388
 
-        Geometry policy:
-            - resize image and mask to 572x572
-            - train augmentation happens on the 572x572 pair
-            - final supervision mask is center-cropped to 388x388
-              to match original U-Net valid-conv output size
+        Val:
+            1) aspect-ratio-preserving resize so short side >= 572
+            2) center crop to 572x572
+            3) normalize image
+            4) center-crop mask to 388x388
         """
-        image = TF.resize(
-            image,
-            self.INPUT_SIZE,
-            interpolation=InterpolationMode.BILINEAR,
-        )
-        mask = TF.resize(
-            mask,
-            self.INPUT_SIZE,
-            interpolation=InterpolationMode.NEAREST,
-        )
+        input_h, input_w = self.INPUT_SIZE
+        base_short_side = input_h
 
-        image_t = TF.to_tensor(image)  # (3, 572, 572), float32 in [0, 1]
-        mask_t = torch.from_numpy(np.array(mask, dtype=np.float32)).unsqueeze(
-            0
-        )  # (1, 572, 572)
-
+        # Step 1: aspect-ratio-preserving resize
         if self.augment and self.split == "train":
-            if torch.rand(1).item() < 0.5:
+            scale_jitter = random.uniform(
+                self.min_scale_jitter,
+                self.max_scale_jitter,
+            )
+            target_short_side = max(
+                input_h,
+                int(round(base_short_side * scale_jitter)),
+            )
+        else:
+            target_short_side = base_short_side
+
+        image, mask = self._aspect_ratio_resize_pil(
+            image=image,
+            mask=mask,
+            target_short_side=target_short_side,
+        )
+
+        # Step 2: convert to tensors
+        image_t = TF.to_tensor(image)  # (3, H, W), float32 in [0,1]
+        mask_t = torch.from_numpy(np.array(mask, dtype=np.float32)).unsqueeze(0)
+
+        image_t, mask_t = self._pad_if_needed(
+            image_t=image_t,
+            mask_t=mask_t,
+            min_height=input_h,
+            min_width=input_w,
+        )
+
+        # Step 3: crop to 572x572
+        if self.augment and self.split == "train":
+            image_t, mask_t = self._random_crop_pair(
+                image_t=image_t,
+                mask_t=mask_t,
+                output_size=self.INPUT_SIZE,
+            )
+        else:
+            image_t, mask_t = self._center_crop_pair(
+                image_t=image_t,
+                mask_t=mask_t,
+                output_size=self.INPUT_SIZE,
+            )
+
+        # Step 4: train-only geometric augmentation
+        if self.augment and self.split == "train":
+            if random.random() < 0.5:
                 image_t = TF.hflip(image_t)
                 mask_t = TF.hflip(mask_t)
 
-            # Vertical flip is usually not a good default for natural pet photos.
-            # Leave it out unless your professor explicitly wants it.
-
-            if torch.rand(1).item() < 0.5:
-                angle = float(torch.empty(1).uniform_(-10.0, 10.0).item())
+            if random.random() < 0.5:
+                angle = random.uniform(-self.rotation_degrees, self.rotation_degrees)
                 image_t = TF.rotate(
                     image_t,
                     angle=angle,
@@ -273,7 +422,7 @@ class OxfordPetDataset2015(Dataset):
                     fill=0.0,
                 )
 
-            if torch.rand(1).item() < 0.5:
+            if random.random() < 0.35:
                 _, h, w = image_t.shape
                 displacement = self._sample_displacement(h, w, image_t.device)
 
@@ -290,12 +439,32 @@ class OxfordPetDataset2015(Dataset):
                     fill=0.0,
                 )
 
+            # image only
+            image_t = self.color_jitter(image_t)
+
+        # Step 5: normalize image only
+        image_t = TF.normalize(
+            image_t,
+            mean=self.NORM_MEAN,
+            std=self.NORM_STD,
+        )
+
+        # Step 6: center-crop supervision mask to 388x388
         mask_t = self._center_crop_tensor(mask_t, self.TARGET_SIZE)
 
         return image_t, mask_t
 
     def _apply_test_image_transform(self, image: Image.Image) -> Tensor:
-        
+        """
+        Keep original resolution for sliding-window inference.
+
+        Important:
+        - no resize
+        - no crop
+        - no normalization here
+
+        Inference must normalize each sliding-window patch before model call.
+        """
         return TF.to_tensor(image)  # shape: (3, H_original, W_original)
 
     @staticmethod
@@ -359,6 +528,10 @@ if __name__ == "__main__":
     print("Train image dtype:", x.dtype)
     print("Train mask dtype: ", y.dtype)
     print("Train mask unique:", torch.unique(y))
+
+    x_val, y_val = val_ds[0]
+    print("Val image shape:  ", tuple(x_val.shape))
+    print("Val mask shape:   ", tuple(y_val.shape))
 
     x_test, pet_id = test_ds[0]
     print("Test image shape: ", tuple(x_test.shape))

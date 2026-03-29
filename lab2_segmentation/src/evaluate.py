@@ -1,8 +1,9 @@
-# evaluation.py
+# evaluate.py
 from typing import Tuple
 import torch
 from torch import nn, Tensor
 from torch.utils.data import DataLoader
+
 
 def dice_score_from_logits(
     logits: Tensor,
@@ -19,6 +20,7 @@ def dice_score_from_logits(
     denominator = preds_fg.sum(dim=1) + targets_fg.sum(dim=1)
     dice = (2.0 * intersection + eps) / (denominator + eps)
     return dice.mean()
+
 
 @torch.no_grad()
 def validate_one_epoch(

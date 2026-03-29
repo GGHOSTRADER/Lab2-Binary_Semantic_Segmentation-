@@ -2,12 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 import csv
+import math
 
 import numpy as np
-from PIL import Image
-
 import torch
-import torch.nn.functional as F
 from torch import nn, Tensor
 from torch.utils.data import DataLoader
 
@@ -16,8 +14,18 @@ from models.unet import UNet2015
 from utils import get_device, load_checkpoint
 
 
+# Must match training normalization
+NORM_MEAN = [0.485, 0.456, 0.406]
+NORM_STD = [0.229, 0.224, 0.225]
+
+
 def mask_to_rle(mask: np.ndarray) -> str:
-    """Convert a binary mask to Run-Length Encoding (RLE) in column-major order."""
+    """
+    Convert a binary mask to Run-Length Encoding (RLE) in column-major order.
+
+    Expected input:
+        mask: ndarray of shape (H, W), values in {0, 1}
+    """
     if mask.ndim != 2:
         raise ValueError(f"mask must be 2D, got shape={mask.shape}")
 
@@ -30,68 +38,120 @@ def mask_to_rle(mask: np.ndarray) -> str:
     return " ".join(str(x) for x in changes)
 
 
-def get_original_image_size(dataset_root: str | Path, image_id: str) -> tuple[int, int]:
-    """Read the original image size from the raw dataset image."""
-    image_path = Path(dataset_root) / "images" / f"{image_id}.jpg"
-    if not image_path.exists():
-        raise FileNotFoundError(f"Original image not found: {image_path}")
-
-    with Image.open(image_path) as img:
-        width, height = img.size
-
-    return height, width
+def build_normalization_tensors(device: torch.device) -> tuple[Tensor, Tensor]:
+    mean = torch.tensor(NORM_MEAN, dtype=torch.float32, device=device).view(1, 3, 1, 1)
+    std = torch.tensor(NORM_STD, dtype=torch.float32, device=device).view(1, 3, 1, 1)
+    return mean, std
 
 
 @torch.no_grad()
 def sliding_window_inference(
     model: nn.Module,
     image: Tensor,
+    mean: Tensor,
+    std: Tensor,
     patch_size: int = 572,
-    stride: int = 388,
-    device: torch.device = torch.device("cpu"),
+    output_size: int = 388,
 ) -> Tensor:
     """
-    Perform sliding-window inference on a single image tensor.
+    Perform overlap-tile inference for the original 2015 U-Net.
+
+    Model geometry:
+        input patch  = 572 x 572
+        output patch = 388 x 388
+
+    The output corresponds only to the CENTER of the input patch.
+    Therefore, we tile the final prediction using 388x388 output tiles,
+    while feeding 572x572 context patches to the model.
 
     Args:
-        model: UNet2015 model.
-        image: Tensor of shape (1, 3, H, W) in original resolution.
-        patch_size: patch size to feed the U-Net.
-        stride: stride for sliding window (overlap = patch_size - stride).
-        device: torch device.
+        model:
+            UNet2015 model.
+        image:
+            Tensor of shape (1, 3, H, W), already on the target device.
+            Expected value range: [0, 1] before normalization.
+        mean:
+            Normalization mean tensor of shape (1, 3, 1, 1).
+        std:
+            Normalization std tensor of shape (1, 3, 1, 1).
+        patch_size:
+            Input patch size for the model. For original U-Net: 572.
+        output_size:
+            Valid output tile size from the model. For original U-Net: 388.
 
     Returns:
-        full_probs: Tensor of shape (1, H, W) with probabilities in [0,1].
+        probs:
+            Tensor of shape (1, H, W), foreground probabilities in [0, 1].
     """
-    _, _, H, W = image.shape
-    full_probs = torch.zeros((1, H, W), dtype=torch.float32, device=device)
-    count_map = torch.zeros((1, H, W), dtype=torch.float32, device=device)
+    if image.ndim != 4 or image.shape[0] != 1:
+        raise ValueError(f"Expected image shape (1, C, H, W), got {tuple(image.shape)}")
 
-    for y in range(0, H, stride):
-        for x in range(0, W, stride):
-            y1 = y
-            x1 = x
-            y2 = min(y + patch_size, H)
-            x2 = min(x + patch_size, W)
-            patch = image[:, :, y1:y2, x1:x2]
+    _, channels, height, width = image.shape
 
-            # pad if patch is smaller than patch_size
-            pad_bottom = patch_size - patch.shape[2]
-            pad_right = patch_size - patch.shape[3]
-            if pad_bottom > 0 or pad_right > 0:
-                patch = F.pad(patch, (0, pad_right, 0, pad_bottom))
+    if channels != 3:
+        raise ValueError(f"Expected 3 input channels, got {channels}")
 
-            logits_patch = model(patch.to(device))  # (1,2,388,388)
-            probs_patch = torch.softmax(logits_patch, dim=1)[:, 1:2, :, :]
+    margin = (patch_size - output_size) // 2
+    if margin < 0:
+        raise ValueError(
+            f"Invalid sizes: patch_size={patch_size}, output_size={output_size}"
+        )
 
-            # crop back to the patch size (in case padding was added)
-            probs_patch = probs_patch[:, :, : y2 - y1, : x2 - x1]
+    tiles_y = math.ceil(height / output_size)
+    tiles_x = math.ceil(width / output_size)
 
-            # add to full_probs
-            full_probs[:, y1:y2, x1:x2] += probs_patch
-            count_map[:, y1:y2, x1:x2] += 1
+    padded_height = tiles_y * output_size + 2 * margin
+    padded_width = tiles_x * output_size + 2 * margin
 
-    full_probs /= count_map
+    padded_image = torch.zeros(
+        (1, channels, padded_height, padded_width),
+        dtype=image.dtype,
+        device=image.device,
+    )
+    padded_image[:, :, margin : margin + height, margin : margin + width] = image
+
+    full_probs = torch.zeros(
+        (1, tiles_y * output_size, tiles_x * output_size),
+        dtype=torch.float32,
+        device=image.device,
+    )
+
+    for y_out in range(0, tiles_y * output_size, output_size):
+        for x_out in range(0, tiles_x * output_size, output_size):
+            patch = padded_image[
+                :,
+                :,
+                y_out : y_out + patch_size,
+                x_out : x_out + patch_size,
+            ]
+
+            if patch.shape[-2:] != (patch_size, patch_size):
+                raise ValueError(
+                    f"Patch shape mismatch: got {tuple(patch.shape)}, "
+                    f"expected spatial size {(patch_size, patch_size)}"
+                )
+
+            # Normalize per patch to match training
+            patch = (patch - mean) / std
+
+            logits_patch = model(patch)  # (1, 2, 388, 388)
+            probs_patch = torch.softmax(logits_patch, dim=1)[
+                :, 1, :, :
+            ]  # (1, 388, 388)
+
+            if probs_patch.shape[-2:] != (output_size, output_size):
+                raise ValueError(
+                    f"Output tile shape mismatch: got {tuple(probs_patch.shape)}, "
+                    f"expected spatial size {(output_size, output_size)}"
+                )
+
+            full_probs[
+                :,
+                y_out : y_out + output_size,
+                x_out : x_out + output_size,
+            ] = probs_patch
+
+    full_probs = full_probs[:, :height, :width]
     return full_probs
 
 
@@ -100,34 +160,43 @@ def run_inference(
     model: nn.Module,
     dataloader: DataLoader,
     device: torch.device,
-    dataset_root: str | Path,
     threshold: float = 0.5,
+    patch_size: int = 572,
+    output_size: int = 388,
 ) -> list[tuple[str, str]]:
     """
-    Run sliding-window inference on the test set.
+    Run overlap-tile inference on the test set and return submission rows.
+
+    Returns:
+        list of (image_id, encoded_mask)
     """
     model.eval()
     submission_rows: list[tuple[str, str]] = []
+
+    mean, std = build_normalization_tensors(device)
 
     for images, image_ids in dataloader:
         images = images.to(device, non_blocking=True)
 
         for i in range(images.shape[0]):
-            image = images[i : i + 1, :, :, :]  # (1,3,H,W)
-            original_size = get_original_image_size(dataset_root, image_ids[i])
-            full_probs = sliding_window_inference(model, image, device=device)
+            image = images[i : i + 1]  # (1, 3, H, W)
+            image_id = image_ids[i]
 
-            # resize to original image size
-            full_probs_resized = F.interpolate(
-                full_probs.unsqueeze(0),
-                size=original_size,
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze(0)
+            full_probs = sliding_window_inference(
+                model=model,
+                image=image,
+                mean=mean,
+                std=std,
+                patch_size=patch_size,
+                output_size=output_size,
+            )  # (1, H, W)
 
-            binary_mask = (full_probs_resized > threshold).to(torch.uint8).cpu().numpy()
+            binary_mask = (
+                (full_probs.squeeze(0) > threshold).to(torch.uint8).cpu().numpy()
+            )
             encoded_mask = mask_to_rle(binary_mask)
-            submission_rows.append((image_ids[i], encoded_mask))
+
+            submission_rows.append((image_id, encoded_mask))
 
     return submission_rows
 
@@ -135,13 +204,18 @@ def run_inference(
 def save_submission_csv(rows: list[tuple[str, str]], save_path: str | Path) -> None:
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
+
     with save_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["image_id", "encoded_mask"])
         writer.writerows(rows)
 
 
-def build_test_dataloader(dataset_root: str | Path, batch_size: int, num_workers: int) -> DataLoader:
+def build_test_dataloader(
+    dataset_root: str | Path,
+    batch_size: int,
+    num_workers: int,
+) -> DataLoader:
     test_dataset = OxfordPetDataset2015(
         root=dataset_root,
         split="test",
@@ -160,7 +234,6 @@ def build_test_dataloader(dataset_root: str | Path, batch_size: int, num_workers
         pin_memory=use_pin_memory,
         persistent_workers=use_persistent_workers,
     )
-
     return test_loader
 
 
@@ -172,16 +245,38 @@ def build_model(device: torch.device, model_path: str | Path) -> nn.Module:
 
 
 def main() -> None:
-    dataset_root = "dataset/oxford-iiit-pet"
-    batch_size = 1  # sliding window works better with batch_size=1
+    project_root = Path(__file__).resolve().parents[1]
+    dataset_root = project_root / "dataset" / "oxford-iiit-pet"
+    model_path = project_root / "saved_models" / "unet2015_rgb_best.pth"
+    submission_path = project_root / "submissions" / "unet2015_rgb_sliding_window.csv"
+
+    batch_size = 1
     num_workers = 0
     threshold = 0.5
+    patch_size = 572
+    output_size = 388
 
-    model_path = "saved_models/unet2015_rgb_best.pth"
-    submission_path = "submissions/unet2015_rgb_sliding_window.csv"
+    if not dataset_root.exists():
+        raise FileNotFoundError(f"Dataset root not found: {dataset_root}")
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
 
     device = get_device()
-    print(f"Using device: {device}")
+
+    print("\n" + "=" * 60)
+    print("INFERENCE CONFIGURATION")
+    print("=" * 60)
+    print(f"Device:            {device}")
+    print(f"Dataset root:      {dataset_root}")
+    print(f"Model path:        {model_path}")
+    print(f"Submission path:   {submission_path}")
+    print(f"Batch size:        {batch_size}")
+    print(f"Num workers:       {num_workers}")
+    print(f"Threshold:         {threshold}")
+    print(f"Patch size:        {patch_size}")
+    print(f"Output size:       {output_size}")
+    print(f"Normalization:     mean={NORM_MEAN}, std={NORM_STD}")
+    print("=" * 60 + "\n")
 
     test_loader = build_test_dataloader(
         dataset_root=dataset_root,
@@ -197,8 +292,9 @@ def main() -> None:
         model=model,
         dataloader=test_loader,
         device=device,
-        dataset_root=dataset_root,
         threshold=threshold,
+        patch_size=patch_size,
+        output_size=output_size,
     )
 
     if len(submission_rows) != len(test_loader.dataset):
