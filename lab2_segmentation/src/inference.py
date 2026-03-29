@@ -247,7 +247,7 @@ def build_model(device: torch.device, model_path: str | Path) -> nn.Module:
 def main() -> None:
     project_root = Path(__file__).resolve().parents[1]
     dataset_root = project_root / "dataset" / "oxford-iiit-pet"
-    model_path = project_root / "saved_models" / "unet2015_rgb_best.pth"
+    model_path = project_root / "saved_models" / "unet_best_clean.pth"
     submission_path = project_root / "submissions" / "unet2015_rgb_sliding_window.csv"
 
     batch_size = 1

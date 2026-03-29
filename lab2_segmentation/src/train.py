@@ -15,7 +15,7 @@ from models.unet import UNet2015
 # -----------------------------
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATASET_ROOT = PROJECT_ROOT / "dataset" / "oxford-iiit-pet"
-MODEL_SAVE_PATH = PROJECT_ROOT / "saved_models" / "unet_oxford_pet.pth"
+MODEL_SAVE_PATH = PROJECT_ROOT / "saved_models" / "unet_best_clean.pth"
 
 # -----------------------------
 # Config
