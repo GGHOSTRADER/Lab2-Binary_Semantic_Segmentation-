@@ -1,4 +1,3 @@
-# kaggle_style_evaluate.py
 from __future__ import annotations
 
 from pathlib import Path
@@ -53,7 +52,7 @@ def sliding_window_probability_map(
     True overlap-tile inference for original U-Net.
 
     Important for this validation script:
-    - `image` already comes normalized from OxfordPetDataset2015(split="val")
+    - `image` already comes normalized from OxfordPetDataset2015(split="val_kaggle")
     - so DO NOT normalize again here
     """
     if image.ndim != 4 or image.shape[0] != 1:
@@ -126,30 +125,31 @@ def sliding_window_probability_map(
 
 
 @torch.no_grad()
-def validate_sliding_window(
+def cache_sliding_window_probabilities(
     model: nn.Module,
     dataloader: DataLoader,
     device: torch.device,
     dataset_root: str | Path,
-    threshold: float = 0.5,
     patch_size: int = 572,
     output_size: int = 388,
-) -> float:
+) -> list[tuple[str, np.ndarray, np.ndarray]]:
     """
-    Standalone sliding-window validation.
+    Cache full-resolution probability maps and corresponding raw binary masks.
 
-    Uses validation images from OxfordPetDataset2015(split="val") and compares
-    predictions against original raw trimap-derived binary masks.
+    Returns:
+        list of tuples:
+            (pet_id, pred_probs_resized_to_true_mask, true_mask)
     """
     model.eval()
-    total_dice = 0.0
-    total_samples = 0
+    cached_items: list[tuple[str, np.ndarray, np.ndarray]] = []
 
-    for images, _, pet_ids in tqdm(dataloader, desc="Sliding Window Val"):
+    for images, _, pet_ids in tqdm(
+        dataloader, desc="Caching sliding-window probabilities"
+    ):
         images = images.to(device, non_blocking=True)
 
         for i in range(images.shape[0]):
-            image = images[i : i + 1]  # already normalized
+            image = images[i : i + 1]
             pet_id = pet_ids[i]
 
             probs = sliding_window_probability_map(
@@ -159,24 +159,54 @@ def validate_sliding_window(
                 output_size=output_size,
             )
 
-            pred_mask = (probs.squeeze(0) > threshold).to(torch.uint8).cpu().numpy()
-
+            probs_np = probs.squeeze(0).cpu().numpy()  # (H_pred, W_pred)
             true_mask = load_original_binary_mask(dataset_root, pet_id)
 
-            pred_mask_img = Image.fromarray(pred_mask.astype(np.uint8) * 255)
-            pred_mask_resized = pred_mask_img.resize(
+            probs_img = Image.fromarray((probs_np * 255.0).astype(np.uint8))
+            probs_resized = probs_img.resize(
                 (true_mask.shape[1], true_mask.shape[0]),
-                resample=Image.NEAREST,
+                resample=Image.BILINEAR,
             )
-            pred_mask_final = (np.array(pred_mask_resized) > 0).astype(np.uint8)
+            probs_final = np.array(probs_resized, dtype=np.float32) / 255.0
 
-            total_dice += dice_score_binary_masks(pred_mask_final, true_mask)
-            total_samples += 1
+            cached_items.append((pet_id, probs_final, true_mask))
 
-    if total_samples == 0:
+    if not cached_items:
         raise ValueError("No validation samples processed.")
 
-    return total_dice / total_samples
+    return cached_items
+
+
+def sweep_thresholds(
+    cached_items: list[tuple[str, np.ndarray, np.ndarray]],
+    thresholds: list[float],
+) -> tuple[float, float, list[tuple[float, float]]]:
+    """
+    Evaluate Dice over a threshold grid using cached probability maps.
+
+    Returns:
+        best_threshold, best_dice, results
+    where results is a list of (threshold, mean_dice)
+    """
+    results: list[tuple[float, float]] = []
+    best_threshold = -1.0
+    best_dice = float("-inf")
+
+    for threshold in thresholds:
+        total_dice = 0.0
+
+        for _, probs_final, true_mask in cached_items:
+            pred_mask = (probs_final > threshold).astype(np.uint8)
+            total_dice += dice_score_binary_masks(pred_mask, true_mask)
+
+        mean_dice = total_dice / len(cached_items)
+        results.append((threshold, mean_dice))
+
+        if mean_dice > best_dice:
+            best_dice = mean_dice
+            best_threshold = threshold
+
+    return best_threshold, best_dice, results
 
 
 def build_val_dataloader(
@@ -219,9 +249,29 @@ def main() -> None:
 
     batch_size = 1
     num_workers = 0
-    threshold = 0.5
     patch_size = 572
     output_size = 388
+
+    thresholds = [
+        0.05,
+        0.10,
+        0.15,
+        0.20,
+        0.25,
+        0.30,
+        0.35,
+        0.40,
+        0.45,
+        0.50,
+        0.55,
+        0.60,
+        0.65,
+        0.70,
+        0.75,
+        0.80,
+        0.85,
+        0.90,
+    ]
 
     if not dataset_root.exists():
         raise FileNotFoundError(f"Dataset root not found: {dataset_root}")
@@ -238,10 +288,10 @@ def main() -> None:
     print(f"Model path:        {model_path}")
     print(f"Batch size:        {batch_size}")
     print(f"Num workers:       {num_workers}")
-    print(f"Threshold:         {threshold}")
     print(f"Patch size:        {patch_size}")
     print(f"Output size:       {output_size}")
-    print("Normalization:     already applied by val dataset")
+    print("Normalization:     already applied by val_kaggle dataset")
+    print(f"Threshold sweep:   {thresholds}")
     print("=" * 60 + "\n")
 
     val_loader = build_val_dataloader(
@@ -254,17 +304,27 @@ def main() -> None:
 
     model = build_model(device=device, model_path=model_path)
 
-    dice = validate_sliding_window(
+    cached_items = cache_sliding_window_probabilities(
         model=model,
         dataloader=val_loader,
         device=device,
         dataset_root=dataset_root,
-        threshold=threshold,
         patch_size=patch_size,
         output_size=output_size,
     )
 
-    print(f"Sliding-window Dice on validation set: {dice:.4f}")
+    best_threshold, best_dice, results = sweep_thresholds(
+        cached_items=cached_items,
+        thresholds=thresholds,
+    )
+
+    print("\nThreshold sweep results")
+    print("-" * 40)
+    for threshold, dice in results:
+        print(f"threshold={threshold:.2f} | dice={dice:.4f}")
+    print("-" * 40)
+    print(f"Best threshold: {best_threshold:.2f}")
+    print(f"Best Dice:      {best_dice:.4f}")
 
 
 if __name__ == "__main__":
