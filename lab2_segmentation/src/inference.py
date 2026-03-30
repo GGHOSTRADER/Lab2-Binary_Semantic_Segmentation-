@@ -1,4 +1,3 @@
-# inference.py
 from __future__ import annotations
 
 from pathlib import Path
@@ -9,6 +8,7 @@ import numpy as np
 import torch
 from torch import nn, Tensor
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
 
 from oxford_pet import OxfordPetDataset2015
 from models.unet import UNet2015
@@ -46,7 +46,7 @@ def build_normalization_tensors(device: torch.device) -> tuple[Tensor, Tensor]:
 
 
 @torch.no_grad()
-def sliding_window_inference(
+def sliding_window_logits_map(
     model: nn.Module,
     image: Tensor,
     mean: Tensor,
@@ -55,40 +55,28 @@ def sliding_window_inference(
     output_size: int = 388,
 ) -> Tensor:
     """
-    Perform overlap-tile inference for the original 2015 U-Net.
-
-    Model geometry:
-        input patch  = 572 x 572
-        output patch = 388 x 388
-
-    The output corresponds only to the CENTER of the input patch.
-    Therefore, we tile the final prediction using 388x388 output tiles,
-    while feeding 572x572 context patches to the model.
+    Sliding-window inference that returns stitched foreground LOGITS, not probabilities.
 
     Args:
         model:
             UNet2015 model.
         image:
-            Tensor of shape (1, 3, H, W), already on the target device.
-            Expected value range: [0, 1] before normalization.
-        mean:
-            Normalization mean tensor of shape (1, 3, 1, 1).
-        std:
-            Normalization std tensor of shape (1, 3, 1, 1).
+            Tensor of shape (1, 3, H, W), raw test image in [0,1].
+        mean, std:
+            Normalization tensors matching training.
         patch_size:
-            Input patch size for the model. For original U-Net: 572.
+            Input patch size (572 for U-Net 2015).
         output_size:
-            Valid output tile size from the model. For original U-Net: 388.
+            Valid output size (388 for U-Net 2015).
 
     Returns:
-        probs:
-            Tensor of shape (1, H, W), foreground probabilities in [0, 1].
+        full_logits:
+            Tensor of shape (1, H, W) in image-space before final resize.
     """
     if image.ndim != 4 or image.shape[0] != 1:
         raise ValueError(f"Expected image shape (1, C, H, W), got {tuple(image.shape)}")
 
     _, channels, height, width = image.shape
-
     if channels != 3:
         raise ValueError(f"Expected 3 input channels, got {channels}")
 
@@ -111,7 +99,7 @@ def sliding_window_inference(
     )
     padded_image[:, :, margin : margin + height, margin : margin + width] = image
 
-    full_probs = torch.zeros(
+    full_logits = torch.zeros(
         (1, tiles_y * output_size, tiles_x * output_size),
         dtype=torch.float32,
         device=image.device,
@@ -132,28 +120,129 @@ def sliding_window_inference(
                     f"expected spatial size {(patch_size, patch_size)}"
                 )
 
-            # Normalize per patch to match training
             patch = (patch - mean) / std
 
-            logits_patch = model(patch)  # (1, 2, 388, 388)
-            probs_patch = torch.softmax(logits_patch, dim=1)[
-                :, 1, :, :
-            ]  # (1, 388, 388)
+            logits_patch = model(patch)[:, 1, :, :]  # foreground logits only
 
-            if probs_patch.shape[-2:] != (output_size, output_size):
+            if logits_patch.shape[-2:] != (output_size, output_size):
                 raise ValueError(
-                    f"Output tile shape mismatch: got {tuple(probs_patch.shape)}, "
+                    f"Output tile shape mismatch: got {tuple(logits_patch.shape)}, "
                     f"expected spatial size {(output_size, output_size)}"
                 )
 
-            full_probs[
+            full_logits[
                 :,
                 y_out : y_out + output_size,
                 x_out : x_out + output_size,
-            ] = probs_patch
+            ] = logits_patch
 
-    full_probs = full_probs[:, :height, :width]
-    return full_probs
+    full_logits = full_logits[:, :height, :width]
+    return full_logits
+
+
+@torch.no_grad()
+def sliding_window_logits_with_hflip_tta(
+    model: nn.Module,
+    image: Tensor,
+    mean: Tensor,
+    std: Tensor,
+    patch_size: int = 572,
+    output_size: int = 388,
+) -> Tensor:
+    """
+    Horizontal flip TTA on logits:
+    - original image logits
+    - flipped image logits
+    - flip logits back
+    - average
+    """
+    logits_orig = sliding_window_logits_map(
+        model=model,
+        image=image,
+        mean=mean,
+        std=std,
+        patch_size=patch_size,
+        output_size=output_size,
+    )
+
+    image_flip = torch.flip(image, dims=[3])
+    logits_flip = sliding_window_logits_map(
+        model=model,
+        image=image_flip,
+        mean=mean,
+        std=std,
+        patch_size=patch_size,
+        output_size=output_size,
+    )
+    logits_flip = torch.flip(logits_flip, dims=[2])
+
+    return 0.5 * (logits_orig + logits_flip)
+
+
+def resize_logits_to_original_size(
+    logits: Tensor,
+    original_height: int,
+    original_width: int,
+) -> np.ndarray:
+    """
+    Resize stitched logits to original image size in float space.
+
+    Args:
+        logits:
+            Tensor of shape (1, H_pred, W_pred)
+        original_height, original_width:
+            Original image dimensions
+
+    Returns:
+        logits_resized_np:
+            ndarray of shape (original_height, original_width)
+    """
+    logits_t = logits.unsqueeze(1)  # (1, 1, H, W)
+    resized = F.interpolate(
+        logits_t,
+        size=(original_height, original_width),
+        mode="bilinear",
+        align_corners=False,
+    )
+    return resized.squeeze(0).squeeze(0).cpu().numpy()
+
+
+def remove_small_components(mask: np.ndarray, min_size: int) -> np.ndarray:
+    """
+    Remove connected foreground components smaller than min_size.
+    Uses 4-connectivity.
+    """
+    if mask.ndim != 2:
+        raise ValueError(f"mask must be 2D, got shape={mask.shape}")
+
+    visited = np.zeros_like(mask, dtype=bool)
+    out = np.zeros_like(mask, dtype=np.uint8)
+
+    h, w = mask.shape
+    for i in range(h):
+        for j in range(w):
+            if mask[i, j] != 1 or visited[i, j]:
+                continue
+
+            stack = [(i, j)]
+            comp: list[tuple[int, int]] = []
+            visited[i, j] = True
+
+            while stack:
+                x, y = stack.pop()
+                comp.append((x, y))
+
+                for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                    if 0 <= nx < h and 0 <= ny < w:
+                        if mask[nx, ny] == 1 and not visited[nx, ny]:
+                            visited[nx, ny] = True
+                            stack.append((nx, ny))
+
+            if len(comp) >= min_size:
+                for x, y in comp:
+                    out[x, y] = 1
+
+    return out
 
 
 @torch.no_grad()
@@ -161,12 +250,24 @@ def run_inference(
     model: nn.Module,
     dataloader: DataLoader,
     device: torch.device,
-    threshold: float = 0.5,
+    threshold: float = 0.16,
+    temperature: float = 0.8,
+    min_component_size: int = 100,
     patch_size: int = 572,
     output_size: int = 388,
+    use_hflip_tta: bool = True,
 ) -> list[tuple[str, str]]:
     """
-    Run overlap-tile inference on the test set and return submission rows.
+    Run inference on the test set and return submission rows.
+
+    Pipeline:
+    1) sliding-window on logits
+    2) optional horizontal flip TTA
+    3) resize logits to original image size in float space
+    4) temperature scaling
+    5) threshold
+    6) remove small components
+    7) encode as RLE
 
     Returns:
         list of (image_id, encoded_mask)
@@ -182,21 +283,41 @@ def run_inference(
         for i in range(images.shape[0]):
             image = images[i : i + 1]  # (1, 3, H, W)
             image_id = image_ids[i]
+            _, _, original_height, original_width = image.shape
 
-            full_probs = sliding_window_inference(
-                model=model,
-                image=image,
-                mean=mean,
-                std=std,
-                patch_size=patch_size,
-                output_size=output_size,
-            )  # (1, H, W)
+            if use_hflip_tta:
+                logits = sliding_window_logits_with_hflip_tta(
+                    model=model,
+                    image=image,
+                    mean=mean,
+                    std=std,
+                    patch_size=patch_size,
+                    output_size=output_size,
+                )
+            else:
+                logits = sliding_window_logits_map(
+                    model=model,
+                    image=image,
+                    mean=mean,
+                    std=std,
+                    patch_size=patch_size,
+                    output_size=output_size,
+                )
 
-            binary_mask = (
-                (full_probs.squeeze(0) > threshold).to(torch.uint8).cpu().numpy()
+            logits_resized = resize_logits_to_original_size(
+                logits=logits,
+                original_height=original_height,
+                original_width=original_width,
             )
-            encoded_mask = mask_to_rle(binary_mask)
 
+            probs = 1.0 / (1.0 + np.exp(-logits_resized / temperature))
+            binary_mask = (probs > threshold).astype(np.uint8)
+            binary_mask = remove_small_components(
+                binary_mask,
+                min_size=min_component_size,
+            )
+
+            encoded_mask = mask_to_rle(binary_mask)
             submission_rows.append((image_id, encoded_mask))
 
     return submission_rows
@@ -249,13 +370,18 @@ def main() -> None:
     project_root = Path(__file__).resolve().parents[1]
     dataset_root = project_root / "dataset" / "oxford-iiit-pet"
     model_path = project_root / "saved_models" / "unet_best_clean.pth"
-    submission_path = project_root / "submissions" / "unet2015_rgb_sliding_window.csv"
+    submission_path = (
+        project_root / "submissions" / "unet2015_rgb_sliding_window_rle.csv"
+    )
 
     batch_size = 1
     num_workers = 0
-    threshold = 0.5
+    threshold = 0.16
+    temperature = 0.8
+    min_component_size = 100
     patch_size = 572
     output_size = 388
+    use_hflip_tta = True
 
     if not dataset_root.exists():
         raise FileNotFoundError(f"Dataset root not found: {dataset_root}")
@@ -264,20 +390,23 @@ def main() -> None:
 
     device = get_device()
 
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 72)
     print("INFERENCE CONFIGURATION")
-    print("=" * 60)
-    print(f"Device:            {device}")
-    print(f"Dataset root:      {dataset_root}")
-    print(f"Model path:        {model_path}")
-    print(f"Submission path:   {submission_path}")
-    print(f"Batch size:        {batch_size}")
-    print(f"Num workers:       {num_workers}")
-    print(f"Threshold:         {threshold}")
-    print(f"Patch size:        {patch_size}")
-    print(f"Output size:       {output_size}")
-    print(f"Normalization:     mean={NORM_MEAN}, std={NORM_STD}")
-    print("=" * 60 + "\n")
+    print("=" * 72)
+    print(f"Device:                 {device}")
+    print(f"Dataset root:           {dataset_root}")
+    print(f"Model path:             {model_path}")
+    print(f"Submission path:        {submission_path}")
+    print(f"Batch size:             {batch_size}")
+    print(f"Num workers:            {num_workers}")
+    print(f"Patch size:             {patch_size}")
+    print(f"Output size:            {output_size}")
+    print(f"Horizontal flip TTA:    {use_hflip_tta}")
+    print(f"Temperature:            {temperature}")
+    print(f"Threshold:              {threshold}")
+    print(f"Min component size:     {min_component_size}")
+    print(f"Patch normalization:    mean={NORM_MEAN}, std={NORM_STD}")
+    print("=" * 72 + "\n")
 
     test_loader = build_test_dataloader(
         dataset_root=dataset_root,
@@ -294,8 +423,11 @@ def main() -> None:
         dataloader=test_loader,
         device=device,
         threshold=threshold,
+        temperature=temperature,
+        min_component_size=min_component_size,
         patch_size=patch_size,
         output_size=output_size,
+        use_hflip_tta=use_hflip_tta,
     )
 
     if len(submission_rows) != len(test_loader.dataset):
