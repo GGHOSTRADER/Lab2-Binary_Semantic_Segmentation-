@@ -153,11 +153,6 @@ def resize_probability_map_to_true_mask(
     probs_np: np.ndarray,
     true_mask: np.ndarray,
 ) -> np.ndarray:
-    """
-    Resize float probability map to the original mask resolution.
-
-    Uses PIL bilinear resize via float->uint8->float conversion.
-    """
     probs_img = Image.fromarray((probs_np * 255.0).astype(np.uint8))
     probs_resized = probs_img.resize(
         (true_mask.shape[1], true_mask.shape[0]),
@@ -305,35 +300,39 @@ def sweep_thresholds_and_cleanup(
     all_results: list[dict] = []
     best_result: dict | None = None
 
+    jobs: list[tuple[float, str, int]] = []
     for cleanup_mode in cleanup_modes:
         sizes_to_try = [0] if cleanup_mode != "remove_small" else min_component_sizes
-
         for min_size in sizes_to_try:
-            total_dice_for_thresholds: list[float] = []
-
             for threshold in thresholds:
-                total_dice = 0.0
+                jobs.append((threshold, cleanup_mode, min_size))
 
-                for _, probs_final, true_mask in cached_items:
-                    pred_mask = (probs_final > threshold).astype(np.uint8)
-                    pred_mask = apply_cleanup(
-                        pred_mask,
-                        mode=cleanup_mode,
-                        min_size=min_size,
-                    )
-                    total_dice += dice_score_binary_masks(pred_mask, true_mask)
+    for threshold, cleanup_mode, min_size in tqdm(
+        jobs,
+        desc="Threshold + cleanup sweep",
+    ):
+        total_dice = 0.0
 
-                mean_dice = total_dice / len(cached_items)
-                result = {
-                    "threshold": threshold,
-                    "cleanup_mode": cleanup_mode,
-                    "min_size": min_size,
-                    "dice": mean_dice,
-                }
-                all_results.append(result)
+        for _, probs_final, true_mask in cached_items:
+            pred_mask = (probs_final > threshold).astype(np.uint8)
+            pred_mask = apply_cleanup(
+                pred_mask,
+                mode=cleanup_mode,
+                min_size=min_size,
+            )
+            total_dice += dice_score_binary_masks(pred_mask, true_mask)
 
-                if best_result is None or mean_dice > best_result["dice"]:
-                    best_result = result
+        mean_dice = total_dice / len(cached_items)
+        result = {
+            "threshold": threshold,
+            "cleanup_mode": cleanup_mode,
+            "min_size": min_size,
+            "dice": mean_dice,
+        }
+        all_results.append(result)
+
+        if best_result is None or mean_dice > best_result["dice"]:
+            best_result = result
 
     if best_result is None:
         raise ValueError("No sweep results produced.")
@@ -384,8 +383,8 @@ def main() -> None:
     output_size = 388
     use_hflip_tta = True
 
-    # finer sweep around the current sweet spot
-    thresholds = [0.08, 0.10, 0.12, 0.14, 0.15, 0.16, 0.18, 0.20, 0.22]
+    # reduced and finer sweep around the current best zone
+    thresholds = [0.12, 0.14, 0.15, 0.16, 0.18]
 
     cleanup_modes = [
         "none",
@@ -393,7 +392,8 @@ def main() -> None:
         "remove_small",
     ]
 
-    min_component_sizes = [25, 50, 100, 200, 400]
+    # reduced small-component sizes for faster feedback
+    min_component_sizes = [50, 100]
 
     if not dataset_root.exists():
         raise FileNotFoundError(f"Dataset root not found: {dataset_root}")
