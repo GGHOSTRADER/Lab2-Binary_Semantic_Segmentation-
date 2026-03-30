@@ -10,6 +10,7 @@ import torch
 from torch import nn, Tensor
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import torch.nn.functional as F
 
 from oxford_pet import OxfordPetDataset2015
 from models.unet import UNet2015
@@ -49,13 +50,6 @@ def sliding_window_probability_map(
     patch_size: int = 572,
     output_size: int = 388,
 ) -> Tensor:
-    """
-    True overlap-tile inference for original U-Net.
-
-    Important:
-    - `image` already comes normalized from OxfordPetDataset2015(split="val_kaggle")
-    - so DO NOT normalize again here
-    """
     if image.ndim != 4 or image.shape[0] != 1:
         raise ValueError(f"Expected image shape (1, C, H, W), got {tuple(image.shape)}")
 
@@ -153,12 +147,20 @@ def resize_probability_map_to_true_mask(
     probs_np: np.ndarray,
     true_mask: np.ndarray,
 ) -> np.ndarray:
-    probs_img = Image.fromarray((probs_np * 255.0).astype(np.uint8))
-    probs_resized = probs_img.resize(
-        (true_mask.shape[1], true_mask.shape[0]),
-        resample=Image.BILINEAR,
+    """
+    Resize probability map in FLOAT space, without uint8 quantization.
+    """
+    probs_t = torch.from_numpy(probs_np).float().unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+
+    resized = F.interpolate(
+        probs_t,
+        size=true_mask.shape,
+        mode="bilinear",
+        align_corners=False,
     )
-    probs_final = np.array(probs_resized, dtype=np.float32) / 255.0
+
+    probs_final = resized.squeeze(0).squeeze(0).cpu().numpy()
+    probs_final = np.clip(probs_final, 0.0, 1.0)
     return probs_final
 
 
@@ -172,10 +174,6 @@ def cache_sliding_window_probabilities(
     output_size: int = 388,
     use_hflip_tta: bool = True,
 ) -> list[tuple[str, np.ndarray, np.ndarray]]:
-    """
-    Returns:
-        list of (pet_id, resized_probability_map, true_mask)
-    """
     model.eval()
     cached_items: list[tuple[str, np.ndarray, np.ndarray]] = []
 
@@ -216,10 +214,6 @@ def cache_sliding_window_probabilities(
 
 
 def connected_components(binary_mask: np.ndarray) -> list[list[tuple[int, int]]]:
-    """
-    4-connected components for a binary mask.
-    Returns a list of components, each as a list of (row, col) pixels.
-    """
     if binary_mask.ndim != 2:
         raise ValueError(f"binary_mask must be 2D, got {binary_mask.shape}")
 
@@ -292,11 +286,6 @@ def sweep_thresholds_and_cleanup(
     cleanup_modes: list[str],
     min_component_sizes: list[int],
 ) -> tuple[dict, list[dict]]:
-    """
-    Returns:
-        best_result: dict
-        all_results: list[dict]
-    """
     all_results: list[dict] = []
     best_result: dict | None = None
 
@@ -383,16 +372,8 @@ def main() -> None:
     output_size = 388
     use_hflip_tta = True
 
-    # reduced and finer sweep around the current best zone
     thresholds = [0.12, 0.14, 0.15, 0.16, 0.18]
-
-    cleanup_modes = [
-        "none",
-        "largest_only",
-        "remove_small",
-    ]
-
-    # reduced small-component sizes for faster feedback
+    cleanup_modes = ["none", "largest_only", "remove_small"]
     min_component_sizes = [50, 100]
 
     if not dataset_root.exists():
