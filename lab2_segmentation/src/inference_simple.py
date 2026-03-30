@@ -12,12 +12,32 @@ from torch.utils.data import DataLoader
 
 from oxford_pet import OxfordPetDataset2015
 from models.unet import UNet2015
+from models.resnet34_unet import ResNet34UNet
 from utils import get_device, load_checkpoint
 
 
 # Must match training normalization
 NORM_MEAN = [0.485, 0.456, 0.406]
 NORM_STD = [0.229, 0.224, 0.225]
+
+
+def prompt_model_type() -> str:
+    valid_options = {"unet2015", "resnet34_unet"}
+
+    print("\nSelect model architecture for inference:")
+    print("  1) unet2015")
+    print("  2) resnet34_unet")
+
+    while True:
+        choice = input("\nEnter model_type [unet2015 / resnet34_unet]: ").strip()
+
+        if choice in valid_options:
+            return choice
+
+        print(
+            f"Invalid choice: {choice!r}. "
+            f"Please enter exactly one of: {sorted(valid_options)}"
+        )
 
 
 def mask_to_rle(mask: np.ndarray) -> str:
@@ -51,35 +71,25 @@ def simple_inference_probability_map(
     image: Tensor,
     mean: Tensor,
     std: Tensor,
+    model_type: str,
     input_size: int = 572,
-    output_size: int = 388,
+    unet_output_size: int = 388,
 ) -> Tensor:
     """
-    Simple inference strategy:
-    - take full unnormalized image in [0,1]
-    - resize to 572x572
-    - normalize
-    - run model once
-    - get 388x388 foreground probs
-    - pad back to 572x572
+    Architecture-aware simple inference strategy.
 
-    Args:
-        model:
-            UNet2015 model.
-        image:
-            Tensor of shape (1, 3, H, W), values in [0,1].
-        mean:
-            Normalization mean tensor, shape (1, 3, 1, 1).
-        std:
-            Normalization std tensor, shape (1, 3, 1, 1).
-        input_size:
-            Model input size.
-        output_size:
-            Model output size.
+    Common steps:
+        - take full unnormalized image in [0,1]
+        - resize to 572x572
+        - normalize
+        - run model once
 
-    Returns:
-        probs_padded:
-            Tensor of shape (1, 572, 572).
+    UNet2015:
+        - get 388x388 foreground probs
+        - pad back to 572x572
+
+    ResNet34_UNet:
+        - get 572x572 foreground probs directly
     """
     if image.ndim != 4 or image.shape[0] != 1:
         raise ValueError(f"Expected image shape (1, C, H, W), got {tuple(image.shape)}")
@@ -97,35 +107,48 @@ def simple_inference_probability_map(
 
     image_resized = (image_resized - mean) / std
 
-    logits = model(image_resized)  # (1, 2, 388, 388)
-    probs_fg = torch.softmax(logits, dim=1)[:, 1:2, :, :]  # (1, 1, 388, 388)
+    logits = model(image_resized)
+    probs_fg = torch.softmax(logits, dim=1)[:, 1:2, :, :]
 
-    if probs_fg.shape[-2:] != (output_size, output_size):
-        raise ValueError(
-            f"Expected output size ({output_size}, {output_size}), "
-            f"got {tuple(probs_fg.shape[-2:])}"
-        )
+    if model_type == "unet2015":
+        if probs_fg.shape[-2:] != (unet_output_size, unet_output_size):
+            raise ValueError(
+                f"UNet2015 expected output size ({unet_output_size}, {unet_output_size}), "
+                f"got {tuple(probs_fg.shape[-2:])}"
+            )
 
-    total_pad = input_size - output_size
-    if total_pad < 0:
-        raise ValueError(
-            f"Invalid sizes: input_size={input_size}, output_size={output_size}"
-        )
+        total_pad = input_size - unet_output_size
+        if total_pad < 0:
+            raise ValueError(
+                f"Invalid sizes: input_size={input_size}, output_size={unet_output_size}"
+            )
 
-    pad_each_side = total_pad // 2
-    if total_pad % 2 != 0:
-        raise ValueError(
-            f"Expected even padding difference, got input_size - output_size = {total_pad}"
-        )
+        pad_each_side = total_pad // 2
+        if total_pad % 2 != 0:
+            raise ValueError(
+                f"Expected even padding difference, got input_size - output_size = {total_pad}"
+            )
 
-    probs_padded = F.pad(
-        probs_fg,
-        pad=(pad_each_side, pad_each_side, pad_each_side, pad_each_side),
-        mode="constant",
-        value=0.0,
-    )  # (1, 1, 572, 572)
+        probs_full = F.pad(
+            probs_fg,
+            pad=(pad_each_side, pad_each_side, pad_each_side, pad_each_side),
+            mode="constant",
+            value=0.0,
+        )  # (1, 1, 572, 572)
 
-    return probs_padded.squeeze(1)  # (1, 572, 572)
+    elif model_type == "resnet34_unet":
+        if probs_fg.shape[-2:] != (input_size, input_size):
+            raise ValueError(
+                f"ResNet34_UNet expected output size ({input_size}, {input_size}), "
+                f"got {tuple(probs_fg.shape[-2:])}"
+            )
+
+        probs_full = probs_fg  # already (1, 1, 572, 572)
+
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
+
+    return probs_full.squeeze(1)  # (1, 572, 572)
 
 
 @torch.no_grad()
@@ -133,16 +156,21 @@ def run_inference(
     model: nn.Module,
     dataloader: DataLoader,
     device: torch.device,
+    model_type: str,
     threshold: float = 0.5,
     input_size: int = 572,
-    output_size: int = 388,
+    unet_output_size: int = 388,
 ) -> list[tuple[str, str]]:
     """
-    Run simple one-shot inference on the test set and return submission rows.
+    Run one-shot inference on the test set and return submission rows.
 
-    Strategy:
+    UNet2015 strategy:
         full image -> resize to 572 -> normalize -> model ->
         388 output -> pad to 572 -> resize to original -> threshold -> RLE
+
+    ResNet34_UNet strategy:
+        full image -> resize to 572 -> normalize -> model ->
+        572 output -> resize to original -> threshold -> RLE
     """
     model.eval()
     submission_rows: list[tuple[str, str]] = []
@@ -159,17 +187,18 @@ def run_inference(
             original_h = image.shape[-2]
             original_w = image.shape[-1]
 
-            probs_padded = simple_inference_probability_map(
+            probs_full = simple_inference_probability_map(
                 model=model,
                 image=image,
                 mean=mean,
                 std=std,
+                model_type=model_type,
                 input_size=input_size,
-                output_size=output_size,
+                unet_output_size=unet_output_size,
             )  # (1, 572, 572)
 
             probs_resized = F.interpolate(
-                probs_padded.unsqueeze(1),  # (1, 1, 572, 572)
+                probs_full.unsqueeze(1),  # (1, 1, 572, 572)
                 size=(original_h, original_w),
                 mode="bilinear",
                 align_corners=False,
@@ -207,6 +236,7 @@ def build_test_dataloader(
         split="test",
         augment=False,
         return_pet_id=True,
+        model_type="unet2015",  # test path ignores mask logic anyway
     )
 
     use_pin_memory = torch.cuda.is_available()
@@ -223,8 +253,20 @@ def build_test_dataloader(
     return test_loader
 
 
-def build_model(device: torch.device, model_path: str | Path) -> nn.Module:
-    model = UNet2015(in_channels=3, out_channels=2).to(device)
+def build_model(
+    device: torch.device,
+    model_path: str | Path,
+    model_type: str,
+) -> nn.Module:
+    if model_type == "unet2015":
+        model = UNet2015(in_channels=3, out_channels=2).to(device)
+
+    elif model_type == "resnet34_unet":
+        model = ResNet34UNet(in_channels=3, out_channels=2).to(device)
+
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
+
     model = load_checkpoint(model, model_path, device)
     model.eval()
     return model
@@ -233,14 +275,25 @@ def build_model(device: torch.device, model_path: str | Path) -> nn.Module:
 def main() -> None:
     project_root = Path(__file__).resolve().parents[1]
     dataset_root = project_root / "dataset" / "oxford-iiit-pet"
-    model_path = project_root / "saved_models" / "unet_best_clean.pth"
-    submission_path = project_root / "submissions" / "unet2015_rgb_simple.csv"
+
+    model_type = prompt_model_type()
+
+    if model_type == "unet2015":
+        model_path = project_root / "saved_models" / "unet_best_clean.pth"
+        submission_path = project_root / "submissions" / "unet2015_rgb_simple.csv"
+
+    elif model_type == "resnet34_unet":
+        model_path = project_root / "saved_models" / "resnet34_unet_best.pth"
+        submission_path = project_root / "submissions" / "resnet34_unet_simple.csv"
+
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
 
     batch_size = 1
     num_workers = 0
     threshold = 0.5
     input_size = 572
-    output_size = 388
+    unet_output_size = 388
 
     if not dataset_root.exists():
         raise FileNotFoundError(f"Dataset root not found: {dataset_root}")
@@ -252,6 +305,7 @@ def main() -> None:
     print("\n" + "=" * 60)
     print("SIMPLE INFERENCE CONFIGURATION")
     print("=" * 60)
+    print(f"Model type:        {model_type}")
     print(f"Device:            {device}")
     print(f"Dataset root:      {dataset_root}")
     print(f"Model path:        {model_path}")
@@ -260,11 +314,18 @@ def main() -> None:
     print(f"Num workers:       {num_workers}")
     print(f"Threshold:         {threshold}")
     print(f"Input size:        {input_size}")
-    print(f"Output size:       {output_size}")
+    print(f"UNet output size:  {unet_output_size}")
     print(f"Normalization:     mean={NORM_MEAN}, std={NORM_STD}")
-    print(
-        "Strategy:          full image -> resize to 572 -> 388 output -> pad to 572 -> resize to original"
-    )
+
+    if model_type == "unet2015":
+        print(
+            "Strategy:          full image -> resize to 572 -> 388 output -> pad to 572 -> resize to original"
+        )
+    else:
+        print(
+            "Strategy:          full image -> resize to 572 -> 572 output -> resize to original"
+        )
+
     print("=" * 60 + "\n")
 
     test_loader = build_test_dataloader(
@@ -275,29 +336,26 @@ def main() -> None:
 
     print(f"Test dataset size: {len(test_loader.dataset)}")
 
-    model = build_model(device=device, model_path=model_path)
+    model = build_model(
+        device=device,
+        model_path=model_path,
+        model_type=model_type,
+    )
 
     submission_rows = run_inference(
         model=model,
         dataloader=test_loader,
         device=device,
+        model_type=model_type,
         threshold=threshold,
         input_size=input_size,
-        output_size=output_size,
+        unet_output_size=unet_output_size,
     )
 
-    if len(submission_rows) != len(test_loader.dataset):
-        raise ValueError(
-            f"Submission row count mismatch: got {len(submission_rows)}, "
-            f"expected {len(test_loader.dataset)}"
-        )
-
-    image_ids = [image_id for image_id, _ in submission_rows]
-    if len(set(image_ids)) != len(image_ids):
-        raise ValueError("Duplicate image_id values found in submission.")
-
     save_submission_csv(submission_rows, submission_path)
-    print(f"Saved submission CSV to: {submission_path}")
+
+    print(f"Saved submission to: {submission_path}")
+    print(f"Total rows written:  {len(submission_rows)}")
 
 
 if __name__ == "__main__":

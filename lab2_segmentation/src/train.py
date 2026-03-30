@@ -1,3 +1,4 @@
+# train.py
 from pathlib import Path
 
 import torch
@@ -6,8 +7,9 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from oxford_pet import OxfordPetDataset2015
-from evaluate import dice_score_from_logits
+from evaluate import dice_score_from_logits, validate_one_epoch
 from models.unet import UNet2015
+from models.resnet34_unet import ResNet34UNet
 
 
 # -----------------------------
@@ -15,18 +17,65 @@ from models.unet import UNet2015
 # -----------------------------
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATASET_ROOT = PROJECT_ROOT / "dataset" / "oxford-iiit-pet"
-MODEL_SAVE_PATH = PROJECT_ROOT / "saved_models" / "unet_best_clean.pth"
+
+
+# -----------------------------
+# Interactive architecture selection
+# -----------------------------
+def prompt_model_type() -> str:
+    valid_options = {"unet2015", "resnet34_unet"}
+
+    print("\nSelect model architecture:")
+    print("  1) unet2015")
+    print("  2) resnet34_unet")
+
+    while True:
+        choice = input("\nEnter model_type [unet2015 / resnet34_unet]: ").strip()
+
+        if choice in valid_options:
+            return choice
+
+        print(
+            f"Invalid choice: {choice!r}. "
+            f"Please enter exactly one of: {sorted(valid_options)}"
+        )
+
+
+MODEL_TYPE = prompt_model_type()
+
+
+# -----------------------------
+# Save path depends on architecture
+# -----------------------------
+if MODEL_TYPE == "unet2015":
+    MODEL_SAVE_PATH = PROJECT_ROOT / "saved_models" / "unet_best_clean.pth"
+elif MODEL_TYPE == "resnet34_unet":
+    MODEL_SAVE_PATH = PROJECT_ROOT / "saved_models" / "resnet34_unet_best.pth"
+else:
+    raise ValueError(f"Unknown MODEL_TYPE: {MODEL_TYPE}")
 
 
 # -----------------------------
 # Config
 # -----------------------------
-BATCH_SIZE = 4
-NUM_EPOCHS = 30
-LEARNING_RATE = 3e-4
+if MODEL_TYPE == "unet2015":
+    BATCH_SIZE = 4
+    NUM_EPOCHS = 30
+    LEARNING_RATE = 3e-4
+    EARLY_STOPPING_PATIENCE = 8
+
+elif MODEL_TYPE == "resnet34_unet":
+    # Conservative starting point since this model is heavier.
+    BATCH_SIZE = 2
+    NUM_EPOCHS = 30
+    LEARNING_RATE = 3e-4
+    EARLY_STOPPING_PATIENCE = 8
+
+else:
+    raise ValueError(f"Unknown MODEL_TYPE: {MODEL_TYPE}")
+
 NUM_WORKERS = 0
 PIN_MEMORY = torch.cuda.is_available()
-EARLY_STOPPING_PATIENCE = 8
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Loss weights
@@ -82,8 +131,8 @@ def dice_loss_from_logits(
             f"targets must have shape (B, H, W), got {tuple(targets.shape)}"
         )
 
-    probs = torch.softmax(logits, dim=1)[:, foreground_class, :, :]  # (B, H, W)
-    targets_fg = (targets == foreground_class).float()  # (B, H, W)
+    probs = torch.softmax(logits, dim=1)[:, foreground_class, :, :]
+    targets_fg = (targets == foreground_class).float()
 
     probs = probs.reshape(probs.size(0), -1)
     targets_fg = targets_fg.reshape(targets_fg.size(0), -1)
@@ -117,40 +166,21 @@ class CombinedSegmentationLoss(nn.Module):
 
 
 # -----------------------------
-# Validation
-# -----------------------------
-@torch.no_grad()
-def validate_one_epoch(
-    model: nn.Module,
-    dataloader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-) -> tuple[float, float]:
-    model.eval()
-    total_loss = 0.0
-    total_dice = 0.0
-    num_batches = 0
-
-    for images, masks in dataloader:
-        images = images.to(device, non_blocking=True)
-        masks = masks.to(device, non_blocking=True)
-
-        logits = model(images)
-        loss = criterion(logits, masks)
-        dice = dice_score_from_logits(logits, masks)
-
-        total_loss += loss.item()
-        total_dice += dice.item()
-        num_batches += 1
-
-    return total_loss / num_batches, total_dice / num_batches
-
-
-# -----------------------------
 # Data
 # -----------------------------
-train_ds = OxfordPetDataset2015(root=DATASET_ROOT, split="train", augment=True)
-val_ds = OxfordPetDataset2015(root=DATASET_ROOT, split="val", augment=False)
+train_ds = OxfordPetDataset2015(
+    root=DATASET_ROOT,
+    split="train",
+    augment=True,
+    model_type=MODEL_TYPE,
+)
+
+val_ds = OxfordPetDataset2015(
+    root=DATASET_ROOT,
+    split="val",
+    augment=False,
+    model_type=MODEL_TYPE,
+)
 
 train_loader = DataLoader(
     train_ds,
@@ -175,6 +205,7 @@ val_loader = DataLoader(
 print("\n" + "=" * 70)
 print("TRAINING CONFIGURATION")
 print("=" * 70)
+print(f"Model type:        {MODEL_TYPE}")
 print(f"Device:            {DEVICE}")
 print(f"Batch size:        {BATCH_SIZE}")
 print(f"Epochs:            {NUM_EPOCHS}")
@@ -210,16 +241,30 @@ print(f"Train batches:     {len(train_loader)}")
 print(f"Val batches:       {len(val_loader)}")
 
 print("\nModel:")
-print("Architecture:      UNet2015")
-print("Input channels:    3")
-print("Output channels:   2")
+if MODEL_TYPE == "unet2015":
+    print("Architecture:      UNet2015")
+    print("Input channels:    3")
+    print("Output channels:   2")
+    print("Target mask size:  388x388")
+elif MODEL_TYPE == "resnet34_unet":
+    print("Architecture:      ResNet34_UNet")
+    print("Input channels:    3")
+    print("Output channels:   2")
+    print("Target mask size:  572x572")
 print("=" * 70 + "\n")
 
 
 # -----------------------------
 # Model / Loss / Optimizer / Scheduler
 # -----------------------------
-model = UNet2015(in_channels=3, out_channels=2).to(DEVICE)
+if MODEL_TYPE == "unet2015":
+    model = UNet2015(in_channels=3, out_channels=2).to(DEVICE)
+
+elif MODEL_TYPE == "resnet34_unet":
+    model = ResNet34UNet(in_channels=3, out_channels=2).to(DEVICE)
+
+else:
+    raise ValueError(f"Unknown MODEL_TYPE: {MODEL_TYPE}")
 
 criterion = CombinedSegmentationLoss(
     ce_weight=CE_WEIGHT,
@@ -293,6 +338,7 @@ for epoch in range(NUM_EPOCHS):
         dataloader=val_loader,
         criterion=criterion,
         device=DEVICE,
+        model_type=MODEL_TYPE,
     )
 
     scheduler.step(val_dice)

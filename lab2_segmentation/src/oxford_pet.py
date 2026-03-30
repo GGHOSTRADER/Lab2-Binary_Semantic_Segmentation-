@@ -1,3 +1,4 @@
+# oxford_pet.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -39,6 +40,7 @@ class OxfordPetDataset2015(Dataset):
         color_jitter_contrast: float = 0.15,
         color_jitter_saturation: float = 0.10,
         color_jitter_hue: float = 0.03,
+        model_type: str = "unet2015",
     ) -> None:
         super().__init__()
 
@@ -47,6 +49,7 @@ class OxfordPetDataset2015(Dataset):
         self.augment = augment
         self.return_pet_id = return_pet_id
         self.rotation_degrees = rotation_degrees
+        self.model_type = model_type
 
         self.color_jitter = ColorJitter(
             brightness=color_jitter_brightness,
@@ -239,13 +242,13 @@ class OxfordPetDataset2015(Dataset):
             2) random crop to 572x572
             3) augment
             4) normalize
-            5) crop mask to 388x388
+            5) mask handling depends on model_type
 
         Val pipeline:
             1) resize preserving aspect ratio
             2) center crop to 572x572
             3) normalize
-            4) crop mask to 388x388
+            4) mask handling depends on model_type
         """
         input_h, input_w = self.INPUT_SIZE
 
@@ -300,8 +303,18 @@ class OxfordPetDataset2015(Dataset):
         # 4) normalize image only
         image_t = TF.normalize(image_t, mean=self.NORM_MEAN, std=self.NORM_STD)
 
-        # 5) crop mask to 388x388
-        mask_t = self._center_crop_tensor(mask_t, self.TARGET_SIZE)
+        # 5) mask handling depends on architecture
+        if self.model_type == "unet2015":
+            # ORIGINAL behavior (unchanged)
+            mask_t = self._center_crop_tensor(mask_t, self.TARGET_SIZE)
+
+        elif self.model_type == "resnet34_unet":
+            # NEW behavior: keep full 572x572 mask
+            pass
+
+        else:
+            raise ValueError(f"Unknown model_type: {self.model_type}")
+
         mask_t = (mask_t > 0.5).to(torch.int64).squeeze(0)
 
         return image_t, mask_t
@@ -346,10 +359,30 @@ class OxfordPetDataset2015(Dataset):
 if __name__ == "__main__":
     root = Path("/home/ghostrader/dl_class/lab2_segmentation/dataset/oxford-iiit-pet")
 
-    train_ds = OxfordPetDataset2015(root=root, split="train", augment=True)
-    val_ds = OxfordPetDataset2015(root=root, split="val", augment=False)
-    val_kaggle_ds = OxfordPetDataset2015(root=root, split="val_kaggle", augment=False)
-    test_ds = OxfordPetDataset2015(root=root, split="test", augment=False)
+    train_ds = OxfordPetDataset2015(
+        root=root,
+        split="train",
+        augment=True,
+        model_type="unet2015",
+    )
+    val_ds = OxfordPetDataset2015(
+        root=root,
+        split="val",
+        augment=False,
+        model_type="unet2015",
+    )
+    val_kaggle_ds = OxfordPetDataset2015(
+        root=root,
+        split="val_kaggle",
+        augment=False,
+        model_type="unet2015",
+    )
+    test_ds = OxfordPetDataset2015(
+        root=root,
+        split="test",
+        augment=False,
+        model_type="unet2015",
+    )
 
     print(f"Train dataset size:      {len(train_ds)}")
     print(f"Val dataset size:        {len(val_ds)}")
