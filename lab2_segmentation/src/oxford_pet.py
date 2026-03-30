@@ -59,9 +59,9 @@ class OxfordPetDataset2015(Dataset):
         self.annotations_dir = self.root / "annotations"
         self.trimaps_dir = self.annotations_dir / "trimaps"
 
-        self.train_file = self.annotations_dir / "train_kaggle_unet.txt"
-        self.val_file = self.annotations_dir / "val_kaggle_unet.txt"
-        self.test_file = self.annotations_dir / "test_kaggle_unet.txt"
+        self.train_file = self.annotations_dir / "train.txt"
+        self.val_file = self.annotations_dir / "val.txt"
+        self.test_file = self.annotations_dir / "test_unet.txt"
 
         self._validate_paths()
         self.samples = self._build_samples()
