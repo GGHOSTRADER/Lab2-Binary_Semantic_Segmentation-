@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import math
+from collections import deque
 
 import numpy as np
 from PIL import Image
@@ -51,7 +52,7 @@ def sliding_window_probability_map(
     """
     True overlap-tile inference for original U-Net.
 
-    Important for this validation script:
+    Important:
     - `image` already comes normalized from OxfordPetDataset2015(split="val_kaggle")
     - so DO NOT normalize again here
     """
@@ -103,10 +104,8 @@ def sliding_window_probability_map(
                     f"expected spatial size {(patch_size, patch_size)}"
                 )
 
-            logits_patch = model(patch)  # (1, 2, 388, 388)
-            probs_patch = torch.softmax(logits_patch, dim=1)[
-                :, 1, :, :
-            ]  # (1, 388, 388)
+            logits_patch = model(patch)
+            probs_patch = torch.softmax(logits_patch, dim=1)[:, 1, :, :]
 
             if probs_patch.shape[-2:] != (output_size, output_size):
                 raise ValueError(
@@ -131,15 +130,6 @@ def sliding_window_probability_map_with_hflip_tta(
     patch_size: int = 572,
     output_size: int = 388,
 ) -> Tensor:
-    """
-    Sliding-window inference with horizontal flip TTA.
-
-    Steps:
-    1) predict on original image
-    2) predict on horizontally flipped image
-    3) flip the second probability map back
-    4) average both maps
-    """
     probs_orig = sliding_window_probability_map(
         model=model,
         image=image,
@@ -147,17 +137,34 @@ def sliding_window_probability_map_with_hflip_tta(
         output_size=output_size,
     )
 
-    image_flip = torch.flip(image, dims=[3])  # flip width dimension
+    image_flip = torch.flip(image, dims=[3])
     probs_flip = sliding_window_probability_map(
         model=model,
         image=image_flip,
         patch_size=patch_size,
         output_size=output_size,
     )
-    probs_flip = torch.flip(probs_flip, dims=[2])  # flip width back on (1, H, W)
+    probs_flip = torch.flip(probs_flip, dims=[2])
 
-    probs_mean = 0.5 * (probs_orig + probs_flip)
-    return probs_mean
+    return 0.5 * (probs_orig + probs_flip)
+
+
+def resize_probability_map_to_true_mask(
+    probs_np: np.ndarray,
+    true_mask: np.ndarray,
+) -> np.ndarray:
+    """
+    Resize float probability map to the original mask resolution.
+
+    Uses PIL bilinear resize via float->uint8->float conversion.
+    """
+    probs_img = Image.fromarray((probs_np * 255.0).astype(np.uint8))
+    probs_resized = probs_img.resize(
+        (true_mask.shape[1], true_mask.shape[0]),
+        resample=Image.BILINEAR,
+    )
+    probs_final = np.array(probs_resized, dtype=np.float32) / 255.0
+    return probs_final
 
 
 @torch.no_grad()
@@ -171,11 +178,8 @@ def cache_sliding_window_probabilities(
     use_hflip_tta: bool = True,
 ) -> list[tuple[str, np.ndarray, np.ndarray]]:
     """
-    Cache full-resolution probability maps and corresponding raw binary masks.
-
     Returns:
-        list of tuples:
-            (pet_id, pred_probs_resized_to_true_mask, true_mask)
+        list of (pet_id, resized_probability_map, true_mask)
     """
     model.eval()
     cached_items: list[tuple[str, np.ndarray, np.ndarray]] = []
@@ -204,15 +208,9 @@ def cache_sliding_window_probabilities(
                     output_size=output_size,
                 )
 
-            probs_np = probs.squeeze(0).cpu().numpy()  # (H_pred, W_pred)
+            probs_np = probs.squeeze(0).cpu().numpy()
             true_mask = load_original_binary_mask(dataset_root, pet_id)
-
-            probs_img = Image.fromarray((probs_np * 255.0).astype(np.uint8))
-            probs_resized = probs_img.resize(
-                (true_mask.shape[1], true_mask.shape[0]),
-                resample=Image.BILINEAR,
-            )
-            probs_final = np.array(probs_resized, dtype=np.float32) / 255.0
+            probs_final = resize_probability_map_to_true_mask(probs_np, true_mask)
 
             cached_items.append((pet_id, probs_final, true_mask))
 
@@ -222,36 +220,125 @@ def cache_sliding_window_probabilities(
     return cached_items
 
 
-def sweep_thresholds(
+def connected_components(binary_mask: np.ndarray) -> list[list[tuple[int, int]]]:
+    """
+    4-connected components for a binary mask.
+    Returns a list of components, each as a list of (row, col) pixels.
+    """
+    if binary_mask.ndim != 2:
+        raise ValueError(f"binary_mask must be 2D, got {binary_mask.shape}")
+
+    h, w = binary_mask.shape
+    visited = np.zeros((h, w), dtype=bool)
+    components: list[list[tuple[int, int]]] = []
+
+    for r in range(h):
+        for c in range(w):
+            if binary_mask[r, c] != 1 or visited[r, c]:
+                continue
+
+            comp: list[tuple[int, int]] = []
+            q = deque([(r, c)])
+            visited[r, c] = True
+
+            while q:
+                rr, cc = q.popleft()
+                comp.append((rr, cc))
+
+                for nr, nc in ((rr - 1, cc), (rr + 1, cc), (rr, cc - 1), (rr, cc + 1)):
+                    if 0 <= nr < h and 0 <= nc < w:
+                        if binary_mask[nr, nc] == 1 and not visited[nr, nc]:
+                            visited[nr, nc] = True
+                            q.append((nr, nc))
+
+            components.append(comp)
+
+    return components
+
+
+def keep_largest_component(binary_mask: np.ndarray) -> np.ndarray:
+    components = connected_components(binary_mask)
+    if not components:
+        return np.zeros_like(binary_mask, dtype=np.uint8)
+
+    largest = max(components, key=len)
+    out = np.zeros_like(binary_mask, dtype=np.uint8)
+    for r, c in largest:
+        out[r, c] = 1
+    return out
+
+
+def remove_small_components(binary_mask: np.ndarray, min_size: int) -> np.ndarray:
+    components = connected_components(binary_mask)
+    out = np.zeros_like(binary_mask, dtype=np.uint8)
+
+    for comp in components:
+        if len(comp) >= min_size:
+            for r, c in comp:
+                out[r, c] = 1
+
+    return out
+
+
+def apply_cleanup(binary_mask: np.ndarray, mode: str, min_size: int) -> np.ndarray:
+    if mode == "none":
+        return binary_mask
+    if mode == "largest_only":
+        return keep_largest_component(binary_mask)
+    if mode == "remove_small":
+        return remove_small_components(binary_mask, min_size=min_size)
+
+    raise ValueError(f"Unknown cleanup mode: {mode}")
+
+
+def sweep_thresholds_and_cleanup(
     cached_items: list[tuple[str, np.ndarray, np.ndarray]],
     thresholds: list[float],
-) -> tuple[float, float, list[tuple[float, float]]]:
+    cleanup_modes: list[str],
+    min_component_sizes: list[int],
+) -> tuple[dict, list[dict]]:
     """
-    Evaluate Dice over a threshold grid using cached probability maps.
-
     Returns:
-        best_threshold, best_dice, results
-    where results is a list of (threshold, mean_dice)
+        best_result: dict
+        all_results: list[dict]
     """
-    results: list[tuple[float, float]] = []
-    best_threshold = -1.0
-    best_dice = float("-inf")
+    all_results: list[dict] = []
+    best_result: dict | None = None
 
-    for threshold in thresholds:
-        total_dice = 0.0
+    for cleanup_mode in cleanup_modes:
+        sizes_to_try = [0] if cleanup_mode != "remove_small" else min_component_sizes
 
-        for _, probs_final, true_mask in cached_items:
-            pred_mask = (probs_final > threshold).astype(np.uint8)
-            total_dice += dice_score_binary_masks(pred_mask, true_mask)
+        for min_size in sizes_to_try:
+            total_dice_for_thresholds: list[float] = []
 
-        mean_dice = total_dice / len(cached_items)
-        results.append((threshold, mean_dice))
+            for threshold in thresholds:
+                total_dice = 0.0
 
-        if mean_dice > best_dice:
-            best_dice = mean_dice
-            best_threshold = threshold
+                for _, probs_final, true_mask in cached_items:
+                    pred_mask = (probs_final > threshold).astype(np.uint8)
+                    pred_mask = apply_cleanup(
+                        pred_mask,
+                        mode=cleanup_mode,
+                        min_size=min_size,
+                    )
+                    total_dice += dice_score_binary_masks(pred_mask, true_mask)
 
-    return best_threshold, best_dice, results
+                mean_dice = total_dice / len(cached_items)
+                result = {
+                    "threshold": threshold,
+                    "cleanup_mode": cleanup_mode,
+                    "min_size": min_size,
+                    "dice": mean_dice,
+                }
+                all_results.append(result)
+
+                if best_result is None or mean_dice > best_result["dice"]:
+                    best_result = result
+
+    if best_result is None:
+        raise ValueError("No sweep results produced.")
+
+    return best_result, all_results
 
 
 def build_val_dataloader(
@@ -269,7 +356,7 @@ def build_val_dataloader(
     use_pin_memory = torch.cuda.is_available()
     use_persistent_workers = num_workers > 0
 
-    val_loader = DataLoader(
+    return DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
@@ -277,7 +364,6 @@ def build_val_dataloader(
         pin_memory=use_pin_memory,
         persistent_workers=use_persistent_workers,
     )
-    return val_loader
 
 
 def build_model(device: torch.device, model_path: str | Path) -> nn.Module:
@@ -298,26 +384,16 @@ def main() -> None:
     output_size = 388
     use_hflip_tta = True
 
-    thresholds = [
-        0.05,
-        0.10,
-        0.15,
-        0.20,
-        0.25,
-        0.30,
-        0.35,
-        0.40,
-        0.45,
-        0.50,
-        0.55,
-        0.60,
-        0.65,
-        0.70,
-        0.75,
-        0.80,
-        0.85,
-        0.90,
+    # finer sweep around the current sweet spot
+    thresholds = [0.08, 0.10, 0.12, 0.14, 0.15, 0.16, 0.18, 0.20, 0.22]
+
+    cleanup_modes = [
+        "none",
+        "largest_only",
+        "remove_small",
     ]
+
+    min_component_sizes = [25, 50, 100, 200, 400]
 
     if not dataset_root.exists():
         raise FileNotFoundError(f"Dataset root not found: {dataset_root}")
@@ -326,20 +402,22 @@ def main() -> None:
 
     device = get_device()
 
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 72)
     print("SLIDING WINDOW VALIDATION CONFIGURATION")
-    print("=" * 60)
-    print(f"Device:            {device}")
-    print(f"Dataset root:      {dataset_root}")
-    print(f"Model path:        {model_path}")
-    print(f"Batch size:        {batch_size}")
-    print(f"Num workers:       {num_workers}")
-    print(f"Patch size:        {patch_size}")
-    print(f"Output size:       {output_size}")
-    print(f"Horizontal flip TTA: {use_hflip_tta}")
-    print("Normalization:     already applied by val_kaggle dataset")
-    print(f"Threshold sweep:   {thresholds}")
-    print("=" * 60 + "\n")
+    print("=" * 72)
+    print(f"Device:                 {device}")
+    print(f"Dataset root:           {dataset_root}")
+    print(f"Model path:             {model_path}")
+    print(f"Batch size:             {batch_size}")
+    print(f"Num workers:            {num_workers}")
+    print(f"Patch size:             {patch_size}")
+    print(f"Output size:            {output_size}")
+    print(f"Horizontal flip TTA:    {use_hflip_tta}")
+    print("Normalization:          already applied by val_kaggle dataset")
+    print(f"Threshold sweep:        {thresholds}")
+    print(f"Cleanup modes:          {cleanup_modes}")
+    print(f"Min component sizes:    {min_component_sizes}")
+    print("=" * 72 + "\n")
 
     val_loader = build_val_dataloader(
         dataset_root=dataset_root,
@@ -361,18 +439,32 @@ def main() -> None:
         use_hflip_tta=use_hflip_tta,
     )
 
-    best_threshold, best_dice, results = sweep_thresholds(
+    best_result, all_results = sweep_thresholds_and_cleanup(
         cached_items=cached_items,
         thresholds=thresholds,
+        cleanup_modes=cleanup_modes,
+        min_component_sizes=min_component_sizes,
     )
 
-    print("\nThreshold sweep results")
-    print("-" * 40)
-    for threshold, dice in results:
-        print(f"threshold={threshold:.2f} | dice={dice:.4f}")
-    print("-" * 40)
-    print(f"Best threshold: {best_threshold:.2f}")
-    print(f"Best Dice:      {best_dice:.4f}")
+    print("\nAll sweep results")
+    print("-" * 72)
+    for result in all_results:
+        print(
+            f"threshold={result['threshold']:.2f} | "
+            f"cleanup={result['cleanup_mode']} | "
+            f"min_size={result['min_size']} | "
+            f"dice={result['dice']:.4f}"
+        )
+
+    print("-" * 72)
+    print("BEST RESULT")
+    print(
+        f"threshold={best_result['threshold']:.2f} | "
+        f"cleanup={best_result['cleanup_mode']} | "
+        f"min_size={best_result['min_size']} | "
+        f"dice={best_result['dice']:.4f}"
+    )
+    print("-" * 72)
 
 
 if __name__ == "__main__":
