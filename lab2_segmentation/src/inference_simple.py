@@ -1,4 +1,3 @@
-# inference_simple.py
 from __future__ import annotations
 
 from pathlib import Path
@@ -9,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from oxford_pet import OxfordPetDataset2015
 from models.unet import UNet2015
@@ -177,7 +177,11 @@ def run_inference(
 
     mean, std = build_normalization_tensors(device)
 
-    for images, image_ids in dataloader:
+    for images, image_ids in tqdm(
+        dataloader,
+        desc="Inference",
+        total=len(dataloader),
+    ):
         images = images.to(device, non_blocking=True)
 
         for i in range(images.shape[0]):
