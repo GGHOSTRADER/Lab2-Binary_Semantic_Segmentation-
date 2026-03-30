@@ -1,4 +1,3 @@
-# oxford_pet.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -62,9 +61,17 @@ class OxfordPetDataset2015(Dataset):
         self.annotations_dir = self.root / "annotations"
         self.trimaps_dir = self.annotations_dir / "trimaps"
 
+        # Shared train/val splits
         self.train_file = self.annotations_dir / "train.txt"
         self.val_file = self.annotations_dir / "val.txt"
-        self.test_file = self.annotations_dir / "test_unet.txt"
+
+        # Architecture-specific test split
+        if self.model_type == "unet2015":
+            self.test_file = self.annotations_dir / "test_unet.txt"
+        elif self.model_type == "resnet34_unet":
+            self.test_file = self.annotations_dir / "test_res_unet.txt"
+        else:
+            raise ValueError(f"Unknown model_type: {self.model_type}")
 
         self._validate_paths()
         self.samples = self._build_samples()
@@ -252,18 +259,15 @@ class OxfordPetDataset2015(Dataset):
         """
         input_h, input_w = self.INPUT_SIZE
 
-        # 1) aspect-ratio-preserving resize so short side >= 572
         image, mask = self._aspect_ratio_resize_pil(
             image=image,
             mask=mask,
             target_short_side=input_h,
         )
 
-        # convert to tensors
-        image_t = TF.to_tensor(image)  # (3, H, W), float in [0,1]
+        image_t = TF.to_tensor(image)
         mask_t = torch.from_numpy(np.array(mask, dtype=np.float32)).unsqueeze(0)
 
-        # 2) crop to 572x572
         if self.split == "train":
             image_t, mask_t = self._random_crop_pair(
                 image_t=image_t,
@@ -277,7 +281,6 @@ class OxfordPetDataset2015(Dataset):
                 output_size=self.INPUT_SIZE,
             )
 
-        # 3) augment (train only, and only if augment=True)
         if self.split == "train" and self.augment:
             if random.random() < 0.5:
                 image_t = TF.hflip(image_t)
@@ -300,16 +303,12 @@ class OxfordPetDataset2015(Dataset):
 
             image_t = self.color_jitter(image_t)
 
-        # 4) normalize image only
         image_t = TF.normalize(image_t, mean=self.NORM_MEAN, std=self.NORM_STD)
 
-        # 5) mask handling depends on architecture
         if self.model_type == "unet2015":
-            # ORIGINAL behavior (unchanged)
             mask_t = self._center_crop_tensor(mask_t, self.TARGET_SIZE)
 
         elif self.model_type == "resnet34_unet":
-            # NEW behavior: keep full 572x572 mask
             pass
 
         else:
@@ -326,7 +325,6 @@ class OxfordPetDataset2015(Dataset):
         sample = self.samples[index]
         image = self._load_image(sample.image_path)
 
-        # TEST: keep as current behavior
         if self.split == "test":
             image_t = TF.to_tensor(image)
             return image_t, sample.pet_id
@@ -334,7 +332,6 @@ class OxfordPetDataset2015(Dataset):
         trimap = self._load_trimap(sample.mask_path)
         binary_mask = self._trimap_to_binary_mask(trimap)
 
-        # VAL_KAGGLE: keep as current behavior
         if self.split == "val_kaggle":
             image_t = TF.to_tensor(image)
             image_t = TF.normalize(image_t, mean=self.NORM_MEAN, std=self.NORM_STD)
@@ -347,7 +344,6 @@ class OxfordPetDataset2015(Dataset):
 
             return image_t, mask_t
 
-        # TRAIN / VAL: improved pipeline
         image_t, mask_t = self._apply_train_val_transforms(image, binary_mask)
 
         if self.return_pet_id:
@@ -377,35 +373,21 @@ if __name__ == "__main__":
         augment=False,
         model_type="unet2015",
     )
-    test_ds = OxfordPetDataset2015(
+    test_ds_unet = OxfordPetDataset2015(
         root=root,
         split="test",
         augment=False,
         model_type="unet2015",
     )
+    test_ds_resnet = OxfordPetDataset2015(
+        root=root,
+        split="test",
+        augment=False,
+        model_type="resnet34_unet",
+    )
 
     print(f"Train dataset size:      {len(train_ds)}")
     print(f"Val dataset size:        {len(val_ds)}")
     print(f"Val_kaggle dataset size: {len(val_kaggle_ds)}")
-    print(f"Test dataset size:       {len(test_ds)}")
-
-    x_train, y_train = train_ds[0]
-    print("Train image shape:", tuple(x_train.shape))
-    print("Train mask shape: ", tuple(y_train.shape))
-    print("Train image dtype:", x_train.dtype)
-    print("Train mask dtype: ", y_train.dtype)
-    print("Train mask unique:", torch.unique(y_train))
-
-    x_val, y_val = val_ds[0]
-    print("Val image shape:  ", tuple(x_val.shape))
-    print("Val mask shape:   ", tuple(y_val.shape))
-    print("Val mask unique:  ", torch.unique(y_val))
-
-    x_vk, y_vk = val_kaggle_ds[0]
-    print("Val_kaggle image shape:", tuple(x_vk.shape))
-    print("Val_kaggle mask shape: ", tuple(y_vk.shape))
-    print("Val_kaggle mask unique:", torch.unique(y_vk))
-
-    x_test, pet_id = test_ds[0]
-    print("Test image shape: ", tuple(x_test.shape))
-    print("Test pet_id:      ", pet_id)
+    print(f"Test UNet dataset size:  {len(test_ds_unet)}")
+    print(f"Test ResNet dataset size:{len(test_ds_resnet)}")
