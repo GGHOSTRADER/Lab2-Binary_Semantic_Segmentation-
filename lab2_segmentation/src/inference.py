@@ -1,7 +1,7 @@
-# inference.py
 from __future__ import annotations
 
 from pathlib import Path
+import argparse
 import csv
 import math
 
@@ -9,24 +9,20 @@ import numpy as np
 import torch
 from torch import nn, Tensor
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
 
 from oxford_pet import OxfordPetDataset2015
 from models.unet import UNet2015
+from models.resnet34_unet import ResNet34UNet
 from utils import get_device, load_checkpoint
 
 
-# Must match training normalization
+# Must match training normalization for UNet2015 path
 NORM_MEAN = [0.485, 0.456, 0.406]
 NORM_STD = [0.229, 0.224, 0.225]
 
 
 def mask_to_rle(mask: np.ndarray) -> str:
-    """
-    Convert a binary mask to Run-Length Encoding (RLE) in column-major order.
-
-    Expected input:
-        mask: ndarray of shape (H, W), values in {0, 1}
-    """
     if mask.ndim != 2:
         raise ValueError(f"mask must be 2D, got shape={mask.shape}")
 
@@ -35,7 +31,6 @@ def mask_to_rle(mask: np.ndarray) -> str:
     padded = np.concatenate([[0], pixels, [0]])
     changes = np.where(padded[1:] != padded[:-1])[0] + 1
     changes[1::2] -= changes[::2]
-
     return " ".join(str(x) for x in changes)
 
 
@@ -45,8 +40,63 @@ def build_normalization_tensors(device: torch.device) -> tuple[Tensor, Tensor]:
     return mean, std
 
 
+# ==============================
+# Shared post-processing
+# ==============================
+def resize_logits_to_original_size(
+    logits: Tensor,
+    original_height: int,
+    original_width: int,
+) -> np.ndarray:
+    logits_t = logits.unsqueeze(1)  # (1, 1, H, W)
+    resized = F.interpolate(
+        logits_t,
+        size=(original_height, original_width),
+        mode="bilinear",
+        align_corners=False,
+    )
+    return resized.squeeze(0).squeeze(0).cpu().numpy()
+
+
+def remove_small_components(mask: np.ndarray, min_size: int) -> np.ndarray:
+    if mask.ndim != 2:
+        raise ValueError(f"mask must be 2D, got shape={mask.shape}")
+
+    visited = np.zeros_like(mask, dtype=bool)
+    out = np.zeros_like(mask, dtype=np.uint8)
+
+    h, w = mask.shape
+    for i in range(h):
+        for j in range(w):
+            if mask[i, j] != 1 or visited[i, j]:
+                continue
+
+            stack = [(i, j)]
+            comp: list[tuple[int, int]] = []
+            visited[i, j] = True
+
+            while stack:
+                x, y = stack.pop()
+                comp.append((x, y))
+
+                for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                    if 0 <= nx < h and 0 <= ny < w:
+                        if mask[nx, ny] == 1 and not visited[nx, ny]:
+                            visited[nx, ny] = True
+                            stack.append((nx, ny))
+
+            if len(comp) >= min_size:
+                for x, y in comp:
+                    out[x, y] = 1
+
+    return out
+
+
+# ==============================
+# UNet2015 branch (keep intact)
+# ==============================
 @torch.no_grad()
-def sliding_window_inference(
+def sliding_window_logits_map(
     model: nn.Module,
     image: Tensor,
     mean: Tensor,
@@ -54,41 +104,10 @@ def sliding_window_inference(
     patch_size: int = 572,
     output_size: int = 388,
 ) -> Tensor:
-    """
-    Perform overlap-tile inference for the original 2015 U-Net.
-
-    Model geometry:
-        input patch  = 572 x 572
-        output patch = 388 x 388
-
-    The output corresponds only to the CENTER of the input patch.
-    Therefore, we tile the final prediction using 388x388 output tiles,
-    while feeding 572x572 context patches to the model.
-
-    Args:
-        model:
-            UNet2015 model.
-        image:
-            Tensor of shape (1, 3, H, W), already on the target device.
-            Expected value range: [0, 1] before normalization.
-        mean:
-            Normalization mean tensor of shape (1, 3, 1, 1).
-        std:
-            Normalization std tensor of shape (1, 3, 1, 1).
-        patch_size:
-            Input patch size for the model. For original U-Net: 572.
-        output_size:
-            Valid output tile size from the model. For original U-Net: 388.
-
-    Returns:
-        probs:
-            Tensor of shape (1, H, W), foreground probabilities in [0, 1].
-    """
     if image.ndim != 4 or image.shape[0] != 1:
         raise ValueError(f"Expected image shape (1, C, H, W), got {tuple(image.shape)}")
 
     _, channels, height, width = image.shape
-
     if channels != 3:
         raise ValueError(f"Expected 3 input channels, got {channels}")
 
@@ -111,7 +130,7 @@ def sliding_window_inference(
     )
     padded_image[:, :, margin : margin + height, margin : margin + width] = image
 
-    full_probs = torch.zeros(
+    full_logits = torch.zeros(
         (1, tiles_y * output_size, tiles_x * output_size),
         dtype=torch.float32,
         device=image.device,
@@ -132,45 +151,68 @@ def sliding_window_inference(
                     f"expected spatial size {(patch_size, patch_size)}"
                 )
 
-            # Normalize per patch to match training
             patch = (patch - mean) / std
+            logits_patch = model(patch)[:, 1, :, :]  # foreground logits only
 
-            logits_patch = model(patch)  # (1, 2, 388, 388)
-            probs_patch = torch.softmax(logits_patch, dim=1)[
-                :, 1, :, :
-            ]  # (1, 388, 388)
-
-            if probs_patch.shape[-2:] != (output_size, output_size):
+            if logits_patch.shape[-2:] != (output_size, output_size):
                 raise ValueError(
-                    f"Output tile shape mismatch: got {tuple(probs_patch.shape)}, "
+                    f"Output tile shape mismatch: got {tuple(logits_patch.shape)}, "
                     f"expected spatial size {(output_size, output_size)}"
                 )
 
-            full_probs[
+            full_logits[
                 :,
                 y_out : y_out + output_size,
                 x_out : x_out + output_size,
-            ] = probs_patch
+            ] = logits_patch
 
-    full_probs = full_probs[:, :height, :width]
-    return full_probs
+    full_logits = full_logits[:, :height, :width]
+    return full_logits
 
 
 @torch.no_grad()
-def run_inference(
+def sliding_window_logits_with_hflip_tta(
+    model: nn.Module,
+    image: Tensor,
+    mean: Tensor,
+    std: Tensor,
+    patch_size: int = 572,
+    output_size: int = 388,
+) -> Tensor:
+    logits_orig = sliding_window_logits_map(
+        model=model,
+        image=image,
+        mean=mean,
+        std=std,
+        patch_size=patch_size,
+        output_size=output_size,
+    )
+
+    image_flip = torch.flip(image, dims=[3])
+    logits_flip = sliding_window_logits_map(
+        model=model,
+        image=image_flip,
+        mean=mean,
+        std=std,
+        patch_size=patch_size,
+        output_size=output_size,
+    )
+    logits_flip = torch.flip(logits_flip, dims=[2])
+
+    return 0.5 * (logits_orig + logits_flip)
+
+
+@torch.no_grad()
+def run_inference_unet2015(
     model: nn.Module,
     dataloader: DataLoader,
     device: torch.device,
-    threshold: float = 0.5,
-    patch_size: int = 572,
-    output_size: int = 388,
+    threshold: float,
+    temperature: float,
+    min_component_size: int,
+    patch_size: int,
+    output_size: int,
 ) -> list[tuple[str, str]]:
-    """
-    Run overlap-tile inference on the test set and return submission rows.
-
-    Returns:
-        list of (image_id, encoded_mask)
-    """
     model.eval()
     submission_rows: list[tuple[str, str]] = []
 
@@ -180,28 +222,113 @@ def run_inference(
         images = images.to(device, non_blocking=True)
 
         for i in range(images.shape[0]):
-            image = images[i : i + 1]  # (1, 3, H, W)
+            image = images[i : i + 1]
             image_id = image_ids[i]
+            _, _, original_height, original_width = image.shape
 
-            full_probs = sliding_window_inference(
+            logits = sliding_window_logits_with_hflip_tta(
                 model=model,
                 image=image,
                 mean=mean,
                 std=std,
                 patch_size=patch_size,
                 output_size=output_size,
-            )  # (1, H, W)
-
-            binary_mask = (
-                (full_probs.squeeze(0) > threshold).to(torch.uint8).cpu().numpy()
             )
-            encoded_mask = mask_to_rle(binary_mask)
 
+            logits_resized = resize_logits_to_original_size(
+                logits=logits,
+                original_height=original_height,
+                original_width=original_width,
+            )
+
+            probs = 1.0 / (1.0 + np.exp(-logits_resized / temperature))
+            binary_mask = (probs > threshold).astype(np.uint8)
+            binary_mask = remove_small_components(binary_mask, min_component_size)
+
+            encoded_mask = mask_to_rle(binary_mask)
             submission_rows.append((image_id, encoded_mask))
 
     return submission_rows
 
 
+# ==============================
+# ResNet34-UNet branch
+# ==============================
+@torch.no_grad()
+def full_image_logits_map_resnet34_unet(
+    model: nn.Module,
+    image: Tensor,
+) -> Tensor:
+    if image.ndim != 4 or image.shape[0] != 1:
+        raise ValueError(f"Expected image shape (1, C, H, W), got {tuple(image.shape)}")
+
+    logits = model(image)  # (1, 2, H, W)
+    if logits.ndim != 4 or logits.shape[1] != 2:
+        raise ValueError(
+            f"Expected logits shape (1, 2, H, W), got {tuple(logits.shape)}"
+        )
+
+    return logits[:, 1, :, :]
+
+
+@torch.no_grad()
+def full_image_logits_with_hflip_tta_resnet34_unet(
+    model: nn.Module,
+    image: Tensor,
+) -> Tensor:
+    logits_orig = full_image_logits_map_resnet34_unet(model, image)
+
+    image_flip = torch.flip(image, dims=[3])
+    logits_flip = full_image_logits_map_resnet34_unet(model, image_flip)
+    logits_flip = torch.flip(logits_flip, dims=[2])
+
+    return 0.5 * (logits_orig + logits_flip)
+
+
+@torch.no_grad()
+def run_inference_resnet34_unet(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    threshold: float,
+    temperature: float,
+    min_component_size: int,
+) -> list[tuple[str, str]]:
+    model.eval()
+    submission_rows: list[tuple[str, str]] = []
+
+    for images, image_ids in dataloader:
+        images = images.to(device, non_blocking=True)
+
+        for i in range(images.shape[0]):
+            image = images[i : i + 1]
+            image_id = image_ids[i]
+            _, _, original_height, original_width = image.shape
+
+            logits = full_image_logits_with_hflip_tta_resnet34_unet(
+                model=model,
+                image=image,
+            )
+
+            logits_resized = resize_logits_to_original_size(
+                logits=logits,
+                original_height=original_height,
+                original_width=original_width,
+            )
+
+            probs = 1.0 / (1.0 + np.exp(-logits_resized / temperature))
+            binary_mask = (probs > threshold).astype(np.uint8)
+            binary_mask = remove_small_components(binary_mask, min_component_size)
+
+            encoded_mask = mask_to_rle(binary_mask)
+            submission_rows.append((image_id, encoded_mask))
+
+    return submission_rows
+
+
+# ==============================
+# Shared utilities
+# ==============================
 def save_submission_csv(rows: list[tuple[str, str]], save_path: str | Path) -> None:
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -227,7 +354,7 @@ def build_test_dataloader(
     use_pin_memory = torch.cuda.is_available()
     use_persistent_workers = num_workers > 0
 
-    test_loader = DataLoader(
+    return DataLoader(
         test_dataset,
         batch_size=batch_size,
         shuffle=False,
@@ -235,27 +362,88 @@ def build_test_dataloader(
         pin_memory=use_pin_memory,
         persistent_workers=use_persistent_workers,
     )
-    return test_loader
 
 
-def build_model(device: torch.device, model_path: str | Path) -> nn.Module:
-    model = UNet2015(in_channels=3, out_channels=2).to(device)
+def build_model(
+    model_type: str,
+    device: torch.device,
+    model_path: str | Path,
+) -> nn.Module:
+    if model_type == "unet2015":
+        model = UNet2015(in_channels=3, out_channels=2).to(device)
+    elif model_type == "resnet34_unet":
+        model = ResNet34UNet(in_channels=3, out_channels=2).to(device)
+    else:
+        raise ValueError(f"Unsupported model_type: {model_type}")
+
     model = load_checkpoint(model, model_path, device)
     model.eval()
     return model
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Inference for segmentation submission"
+    )
+
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        choices=["unet2015", "resnet34_unet"],
+        required=True,
+        help="Choose which model pipeline to run.",
+    )
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default=None,
+        help="Optional explicit checkpoint path.",
+    )
+    parser.add_argument(
+        "--submission_path",
+        type=str,
+        default=None,
+        help="Optional explicit submission CSV path.",
+    )
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--threshold", type=float, default=0.16)
+    parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument("--min_component_size", type=int, default=100)
+    parser.add_argument("--patch_size", type=int, default=572)
+    parser.add_argument("--output_size", type=int, default=388)
+
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
+
     project_root = Path(__file__).resolve().parents[1]
     dataset_root = project_root / "dataset" / "oxford-iiit-pet"
-    model_path = project_root / "saved_models" / "unet_best_clean.pth"
-    submission_path = project_root / "submissions" / "unet2015_rgb_sliding_window.csv"
 
-    batch_size = 1
-    num_workers = 0
-    threshold = 0.5
-    patch_size = 572
-    output_size = 388
+    default_model_paths = {
+        "unet2015": project_root / "saved_models" / "unet_best_clean.pth",
+        "resnet34_unet": project_root / "saved_models" / "resnet34_unet_best.pth",
+    }
+
+    default_submission_paths = {
+        "unet2015": project_root
+        / "submissions"
+        / "unet2015_rgb_sliding_window_rle.csv",
+        "resnet34_unet": project_root / "submissions" / "resnet34_unet_rle.csv",
+    }
+
+    model_path = (
+        Path(args.model_path)
+        if args.model_path
+        else default_model_paths[args.model_type]
+    )
+    submission_path = (
+        Path(args.submission_path)
+        if args.submission_path
+        else default_submission_paths[args.model_type]
+    )
 
     if not dataset_root.exists():
         raise FileNotFoundError(f"Dataset root not found: {dataset_root}")
@@ -264,39 +452,60 @@ def main() -> None:
 
     device = get_device()
 
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 72)
     print("INFERENCE CONFIGURATION")
-    print("=" * 60)
-    print(f"Device:            {device}")
-    print(f"Dataset root:      {dataset_root}")
-    print(f"Model path:        {model_path}")
-    print(f"Submission path:   {submission_path}")
-    print(f"Batch size:        {batch_size}")
-    print(f"Num workers:       {num_workers}")
-    print(f"Threshold:         {threshold}")
-    print(f"Patch size:        {patch_size}")
-    print(f"Output size:       {output_size}")
-    print(f"Normalization:     mean={NORM_MEAN}, std={NORM_STD}")
-    print("=" * 60 + "\n")
+    print("=" * 72)
+    print(f"Model type:             {args.model_type}")
+    print(f"Device:                 {device}")
+    print(f"Dataset root:           {dataset_root}")
+    print(f"Model path:             {model_path}")
+    print(f"Submission path:        {submission_path}")
+    print(f"Batch size:             {args.batch_size}")
+    print(f"Num workers:            {args.num_workers}")
+    print("Horizontal flip TTA:    True")
+    print(f"Temperature:            {args.temperature}")
+    print(f"Threshold:              {args.threshold}")
+    print(f"Min component size:     {args.min_component_size}")
+    if args.model_type == "unet2015":
+        print(f"Patch size:             {args.patch_size}")
+        print(f"Output size:            {args.output_size}")
+        print(f"Patch normalization:    mean={NORM_MEAN}, std={NORM_STD}")
+    print("=" * 72 + "\n")
 
     test_loader = build_test_dataloader(
         dataset_root=dataset_root,
-        batch_size=batch_size,
-        num_workers=num_workers,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
     )
 
     print(f"Test dataset size: {len(test_loader.dataset)}")
 
-    model = build_model(device=device, model_path=model_path)
-
-    submission_rows = run_inference(
-        model=model,
-        dataloader=test_loader,
+    model = build_model(
+        model_type=args.model_type,
         device=device,
-        threshold=threshold,
-        patch_size=patch_size,
-        output_size=output_size,
+        model_path=model_path,
     )
+
+    if args.model_type == "unet2015":
+        submission_rows = run_inference_unet2015(
+            model=model,
+            dataloader=test_loader,
+            device=device,
+            threshold=args.threshold,
+            temperature=args.temperature,
+            min_component_size=args.min_component_size,
+            patch_size=args.patch_size,
+            output_size=args.output_size,
+        )
+    else:
+        submission_rows = run_inference_resnet34_unet(
+            model=model,
+            dataloader=test_loader,
+            device=device,
+            threshold=args.threshold,
+            temperature=args.temperature,
+            min_component_size=args.min_component_size,
+        )
 
     if len(submission_rows) != len(test_loader.dataset):
         raise ValueError(
