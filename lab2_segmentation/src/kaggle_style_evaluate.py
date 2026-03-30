@@ -125,6 +125,42 @@ def sliding_window_probability_map(
 
 
 @torch.no_grad()
+def sliding_window_probability_map_with_hflip_tta(
+    model: nn.Module,
+    image: Tensor,
+    patch_size: int = 572,
+    output_size: int = 388,
+) -> Tensor:
+    """
+    Sliding-window inference with horizontal flip TTA.
+
+    Steps:
+    1) predict on original image
+    2) predict on horizontally flipped image
+    3) flip the second probability map back
+    4) average both maps
+    """
+    probs_orig = sliding_window_probability_map(
+        model=model,
+        image=image,
+        patch_size=patch_size,
+        output_size=output_size,
+    )
+
+    image_flip = torch.flip(image, dims=[3])  # flip width dimension
+    probs_flip = sliding_window_probability_map(
+        model=model,
+        image=image_flip,
+        patch_size=patch_size,
+        output_size=output_size,
+    )
+    probs_flip = torch.flip(probs_flip, dims=[2])  # flip width back on (1, H, W)
+
+    probs_mean = 0.5 * (probs_orig + probs_flip)
+    return probs_mean
+
+
+@torch.no_grad()
 def cache_sliding_window_probabilities(
     model: nn.Module,
     dataloader: DataLoader,
@@ -132,6 +168,7 @@ def cache_sliding_window_probabilities(
     dataset_root: str | Path,
     patch_size: int = 572,
     output_size: int = 388,
+    use_hflip_tta: bool = True,
 ) -> list[tuple[str, np.ndarray, np.ndarray]]:
     """
     Cache full-resolution probability maps and corresponding raw binary masks.
@@ -152,12 +189,20 @@ def cache_sliding_window_probabilities(
             image = images[i : i + 1]
             pet_id = pet_ids[i]
 
-            probs = sliding_window_probability_map(
-                model=model,
-                image=image,
-                patch_size=patch_size,
-                output_size=output_size,
-            )
+            if use_hflip_tta:
+                probs = sliding_window_probability_map_with_hflip_tta(
+                    model=model,
+                    image=image,
+                    patch_size=patch_size,
+                    output_size=output_size,
+                )
+            else:
+                probs = sliding_window_probability_map(
+                    model=model,
+                    image=image,
+                    patch_size=patch_size,
+                    output_size=output_size,
+                )
 
             probs_np = probs.squeeze(0).cpu().numpy()  # (H_pred, W_pred)
             true_mask = load_original_binary_mask(dataset_root, pet_id)
@@ -251,6 +296,7 @@ def main() -> None:
     num_workers = 0
     patch_size = 572
     output_size = 388
+    use_hflip_tta = True
 
     thresholds = [
         0.05,
@@ -290,6 +336,7 @@ def main() -> None:
     print(f"Num workers:       {num_workers}")
     print(f"Patch size:        {patch_size}")
     print(f"Output size:       {output_size}")
+    print(f"Horizontal flip TTA: {use_hflip_tta}")
     print("Normalization:     already applied by val_kaggle dataset")
     print(f"Threshold sweep:   {thresholds}")
     print("=" * 60 + "\n")
@@ -311,6 +358,7 @@ def main() -> None:
         dataset_root=dataset_root,
         patch_size=patch_size,
         output_size=output_size,
+        use_hflip_tta=use_hflip_tta,
     )
 
     best_threshold, best_dice, results = sweep_thresholds(
