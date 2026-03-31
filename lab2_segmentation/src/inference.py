@@ -525,3 +525,7 @@ def main() -> None:
 
     save_submission_csv(submission_rows, submission_path)
     print(f"Saved submission CSV to: {submission_path}")
+
+
+if __name__ == "__main__":
+    main()
