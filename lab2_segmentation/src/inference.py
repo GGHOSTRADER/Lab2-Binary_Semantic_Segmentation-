@@ -297,11 +297,14 @@ def run_inference_resnet34_unet(
     model.eval()
     submission_rows: list[tuple[str, str]] = []
 
+    mean, std = build_normalization_tensors(device)
+
     for images, image_ids in dataloader:
         images = images.to(device, non_blocking=True)
 
         for i in range(images.shape[0]):
             image = images[i : i + 1]
+            image = (image - mean) / std
             image_id = image_ids[i]
             _, _, original_height, original_width = image.shape
 
@@ -522,7 +525,3 @@ def main() -> None:
 
     save_submission_csv(submission_rows, submission_path)
     print(f"Saved submission CSV to: {submission_path}")
-
-
-if __name__ == "__main__":
-    main()
