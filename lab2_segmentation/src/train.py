@@ -65,11 +65,10 @@ if MODEL_TYPE == "unet2015":
     EARLY_STOPPING_PATIENCE = 8
 
 elif MODEL_TYPE == "resnet34_unet":
-    # Conservative starting point since this model is heavier.
-    BATCH_SIZE = 2
-    NUM_EPOCHS = 30
+    BATCH_SIZE = 12
+    NUM_EPOCHS = 40
     LEARNING_RATE = 3e-4
-    EARLY_STOPPING_PATIENCE = 8
+    EARLY_STOPPING_PATIENCE = 6
 
 else:
     raise ValueError(f"Unknown MODEL_TYPE: {MODEL_TYPE}")

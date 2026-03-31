@@ -1,24 +1,53 @@
 (dl_lab2) ghostrader@Guille:~/dl_class/lab2_segmentation$ tree -L 3
 .
+├── README.ME
 ├── dataset
 │   └── oxford-iiit-pet
 │       ├── annotations
 │       └── images
 ├── requirements.txt
 ├── saved_models
-│   ├── unet_best.pth
-│   └── unet_best0.0000.pth
-└── src
-    ├── __pycache__
-    │   └── oxford_pet.cpython-311.pyc
-    ├── dataflow_pet.mmd
-    ├── evaluate.py
-    ├── flowchart_pet.mmd
-    ├── inference.py
-    ├── models
-    │   ├── __pycache__
-    │   ├── resnet34_unet.py
-    │   └── unet.py
-    ├── oxford_pet.py
-    ├── train.py
-    └── utils.py
+│   └── unet_best_clean.pth
+├── src
+│   ├── __pycache__
+│   │   ├── evaluate.cpython-311.pyc
+│   │   ├── oxford_pet.cpython-311.pyc
+│   │   └── utils.cpython-311.pyc
+│   ├── evaluate.py
+│   ├── imagine_check.py
+│   ├── inference.py
+│   ├── inference_simple.py
+│   ├── kaggle_style_evaluate.py
+│   ├── kaggle_style_evaluate_simple.py
+│   ├── models
+│   │   ├── __pycache__
+│   │   ├── resnet34_unet.py
+│   │   └── unet.py
+│   ├── oxford_pet.py
+│   ├── train.py
+│   ├── train_hyperparams.py
+│   ├── train_modified.py
+│   ├── train_speedtest.py
+│   └── utils.py
+└── submissions
+    ├── unet2015_rgb_simple.csv
+    └── unet2015_rgb_submission.csv
+
+10 directories, 22 files
+(dl_lab2) ghostrader@Guille:~/dl_class/lab2_segmentation$ 
+
+
+
+train.py
+User must selected desired training
+
+CLI Input required
+
+Model asks :
+-------------------------------------------------------
+Select model architecture:
+  1) unet2015
+  2) resnet34_unet
+
+Enter model_type [unet2015 / resnet34_unet]: 
+-------------------------------------------------------

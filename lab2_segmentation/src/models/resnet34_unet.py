@@ -1,3 +1,4 @@
+# resnet34_unet.py
 from __future__ import annotations
 
 import torch
@@ -193,9 +194,9 @@ class ResNet34Encoder(nn.Module):
 
 # ============================================================
 # Decoder Block
-# Exact requested channel plan:
-# stage 1: 256 + 512 -> 128
-# stage 2: 128 + 256 -> 32
+# channel :
+# stage 1: 256 + 512 -> 128 My own interpretation of diagram
+# stage 2: 128 + 256 -> 32  My own interpretation of diagram
 # stage 3: 32 + 128  -> 32
 # stage 4: 32 + 64   -> 32
 # ============================================================
@@ -227,7 +228,7 @@ class DecoderBlock(nn.Module):
 
 
 # ============================================================
-# Refinement: 32 -> 32
+# Refinement: 32 -> 32 My own interpretation of diagram
 # ============================================================
 
 
@@ -246,19 +247,17 @@ class Refinement(nn.Module):
 
 
 # ============================================================
-# Final Model
-#
-# REQUIRED SPEC
+# Full Architecture overview:
 #
 # ENCODER
 # 3 -> 64 -> 64 -> 128 -> 256 -> 512
 #
 # DECODER
-# stage 1: 256 + 512 -> 128
-# stage 2: 128 + 256 -> 32
+# stage 1: 256 + 512 -> 128 My own interpretation of diagram
+# stage 2: 128 + 256 -> 32 My own interpretation of diagram
 # stage 3: 32 + 128  -> 32
 # stage 4: 32 + 64   -> 32
-# refinement: 32 -> 32
+# refinement: 32 -> 32 My own interpretation of diagram
 # output: 32 -> output
 # ============================================================
 
@@ -269,7 +268,6 @@ class ResNet34UNet(nn.Module):
 
         self.encoder = ResNet34Encoder(in_channels=in_channels)
 
-        # Exact decoder spec requested by you
         self.dec3 = DecoderBlock(256, 512, 128)  # stage 1: 256 + 512 -> 128
         self.dec2 = DecoderBlock(128, 256, 32)  # stage 2: 128 + 256 -> 32
         self.dec1 = DecoderBlock(32, 128, 32)  # stage 3: 32 + 128  -> 32
@@ -283,7 +281,6 @@ class ResNet34UNet(nn.Module):
 
         stem, e1, e2, e3, bott = self.encoder(x)
 
-        # Exact flow requested by you
         x = self.dec3(e3, bott)  # 256 + 512 -> 128
         x = self.dec2(x, e3)  # 128 + 256 -> 32
         x = self.dec1(x, e2)  # 32 + 128  -> 32

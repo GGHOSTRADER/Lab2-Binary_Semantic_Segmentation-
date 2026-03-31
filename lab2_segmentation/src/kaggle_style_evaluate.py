@@ -1,3 +1,4 @@
+# kaggle_style_evaluate.py
 from __future__ import annotations
 
 from pathlib import Path
@@ -94,7 +95,7 @@ def resize_logits_to_shape(
 
 
 # ==============================
-# UNet2015 branch (keep intact)
+# UNet2015 branch
 # ==============================
 @torch.no_grad()
 def sliding_window_logits_map(
@@ -235,7 +236,7 @@ def cache_logits_resnet34_unet(
 
 
 # ==============================
-# Sweep
+# Sweep for Hyperparameters
 # ==============================
 def sweep(
     cached: list[tuple[np.ndarray, np.ndarray]],
@@ -361,8 +362,8 @@ def main() -> None:
 
     device = get_device()
 
-    thresholds = [0.12, 0.14, 0.15, 0.16]
-    temps = [0.8, 0.9, 1.0, 1.1]
+    thresholds = [0.12, 0.14, 0.15, 0.16, 0.18, 0.20, 0.22]
+    temps = [0.6, 0.7, 0.8, 0.9, 1.0, 1.1]
 
     print("\n" + "=" * 72)
     print("KAGGLE-STYLE EVALUATION CONFIGURATION")
