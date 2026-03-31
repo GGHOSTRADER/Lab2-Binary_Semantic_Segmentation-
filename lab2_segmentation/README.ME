@@ -1,18 +1,24 @@
-(dl_lab2) ghostrader@Guille:~/dl_class/lab2_segmentation$ tree -L 3
-.
+Directory Tree for project to run
+
+lab2_segmentation
 ├── README.ME
 ├── dataset
 │   └── oxford-iiit-pet
 │       ├── annotations
+│       │   ├── README
+│       │   ├── list.txt
+│       │   ├── test_res_unet.txt
+│       │   ├── test_unet.txt
+│       │   ├── train.txt
+│       │   ├── trimaps
+│       │   ├── unet_splits
+│       │   ├── val.txt
+│       │   └── xmls
 │       └── images
 ├── requirements.txt
 ├── saved_models
 │   └── unet_best_clean.pth
 ├── src
-│   ├── __pycache__
-│   │   ├── evaluate.cpython-311.pyc
-│   │   ├── oxford_pet.cpython-311.pyc
-│   │   └── utils.cpython-311.pyc
 │   ├── evaluate.py
 │   ├── imagine_check.py
 │   ├── inference.py
@@ -20,34 +26,116 @@
 │   ├── kaggle_style_evaluate.py
 │   ├── kaggle_style_evaluate_simple.py
 │   ├── models
-│   │   ├── __pycache__
 │   │   ├── resnet34_unet.py
 │   │   └── unet.py
 │   ├── oxford_pet.py
 │   ├── train.py
-│   ├── train_hyperparams.py
-│   ├── train_modified.py
-│   ├── train_speedtest.py
 │   └── utils.py
+├── supporting_hyperparameter_files
+│   ├── train_hyperparams.py
+│   └── train_speedtest.py
 └── submissions
-    ├── unet2015_rgb_simple.csv
-    └── unet2015_rgb_submission.csv
-
-10 directories, 22 files
-(dl_lab2) ghostrader@Guille:~/dl_class/lab2_segmentation$ 
 
 
-
+----------------------------------------------------
 train.py
-User must selected desired training
 
-CLI Input required
+- Use: train both models, already calls datapreprocessing , model, train and validation .
+  User must selected desired training. Will save best model weights.
 
-Model asks :
--------------------------------------------------------
-Select model architecture:
-  1) unet2015
-  2) resnet34_unet
+- Launching of file:
+  Step 1:
+    From  /lab2_segmentation
+  
+  Step 2:
+  In terminal:
+    python src/train.py 
 
-Enter model_type [unet2015 / resnet34_unet]: 
--------------------------------------------------------
+  Step 3:
+    CLI Input required
+
+    Model asks :
+
+    Select model architecture:
+      1) unet2015
+      2) resnet34_unet
+
+    Enter model_type [unet2015 / resnet34_unet]: 
+
+**IMPORTANT**
+No Flag required but must input the model in CLI
+
+----------------------------------------------------
+
+kaggle_style_evaluate.py 
+
+- Use: Validation post train/Val that reflects a close estimate to kaggle. Does not save anything, just prints results.
+
+- Launching of file:
+  Step 1:
+    From  /lab2_segmentation
+
+  Step 2:
+    For unet2015 kaggle style
+    In terminal:
+      python src/kaggle_style_evaluate.py --model_type unet2015   
+
+    for resnet34_unet kaggle style
+    In terminal:
+      python src/kaggle_style_evaluate.py --model_type resnet34_unet
+
+**IMPORTANT**
+MUST USE THE --model_type FLAG to run
+
+----------------------------------------------------
+
+inference.py
+
+- Use: do the final inference on unseen data from test set and create the RLE on csv for kaggle submission.
+
+- Launching of file:
+  Step 1:
+    From  /lab2_segmentation
+
+  Step 2:
+    For unet2015 kaggle style
+    In terminal:
+      python src/inference.py --model_type unet2015   
+
+    for resnet34_unet kaggle style
+    In terminal:
+      python src/inference.py --model_type resnet34_unet
+
+**IMPORTANT**
+MUST USE THE --model_type FLAG to run
+
+----------------------------------------------------
+
+supporting_hyperparameter_files
+
+train_hyperparams.py
+- Use: Was used to test different configurations loss function and learning rate
+- Launching of File:
+  Step 1:
+    From  /lab2_segmentation
+  Step 2:
+    In terminal:
+      python -m supporting_hyperparameter_files.train_hyperparams
+
+**IMPORTANT**
+Works for UNET, must launch as module execution, so python + -m command 
+
+train_speedtest.py
+  - Use: Was used to test different configurations of workers and batch since since training was very slow for UNET.
+
+- Launching of File:
+  Step 1:
+    From  /lab2_segmentation
+  Step 2:
+    In terminal:
+      python -m supporting_hyperparameter_files.train_hyperparams
+
+**IMPORTANT**
+Works for UNET, must launch as module execution, so python + -m command
+
+

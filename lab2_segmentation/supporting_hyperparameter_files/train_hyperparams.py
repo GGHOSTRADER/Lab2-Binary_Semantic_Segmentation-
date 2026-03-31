@@ -1,3 +1,4 @@
+# train_hyperparams.py
 from pathlib import Path
 
 import torch
@@ -5,9 +6,9 @@ from torch import nn, optim, Tensor
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from oxford_pet import OxfordPetDataset2015
-from evaluate import dice_score_from_logits
-from models.unet import UNet2015
+from src.oxford_pet import OxfordPetDataset2015
+from src.evaluate import dice_score_from_logits
+from src.models.unet import UNet2015
 
 
 # -----------------------------

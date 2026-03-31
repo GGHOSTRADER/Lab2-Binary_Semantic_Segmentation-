@@ -9,10 +9,10 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from oxford_pet import OxfordPetDataset2015
-from models.unet import UNet2015
-from evaluate import dice_score_from_logits
-from utils import get_device, set_seed
+from src.oxford_pet import OxfordPetDataset2015
+from src.models.unet import UNet2015
+from src.evaluate import dice_score_from_logits
+from src.utils import get_device, set_seed
 
 
 class CEDiceLoss(nn.Module):
@@ -24,7 +24,9 @@ class CEDiceLoss(nn.Module):
         targets: (B, H, W) with class indices {0, 1}
     """
 
-    def __init__(self, ce_weight: float = 1.0, dice_weight: float = 1.0, smooth: float = 1e-6) -> None:
+    def __init__(
+        self, ce_weight: float = 1.0, dice_weight: float = 1.0, smooth: float = 1e-6
+    ) -> None:
         super().__init__()
         self.ce = nn.CrossEntropyLoss()
         self.ce_weight = ce_weight
@@ -165,9 +167,9 @@ def main() -> None:
         "lr": 0.0003,
         "loss": "ce_dice",
         "scheduler": True,
-        "early_stopping_patience": 8,   # kept for config parity; unused in benchmark-only run
+        "early_stopping_patience": 8,  # kept for config parity; unused in benchmark-only run
         "best_val_dice": 0.7472360991142891,  # historical result; not used for training
-        "best_epoch": 1,                # historical result; not used for training
+        "best_epoch": 1,  # historical result; not used for training
     }
 
     dataset_root = "dataset/oxford-iiit-pet"
@@ -188,7 +190,9 @@ def main() -> None:
     print(f"Learning rate:            {config['lr']}")
     print(f"Loss:                     {config['loss']}")
     print(f"Scheduler enabled:        {config['scheduler']}")
-    print(f"Early stopping patience:  {config['early_stopping_patience']} (unused here)")
+    print(
+        f"Early stopping patience:  {config['early_stopping_patience']} (unused here)"
+    )
     print(f"Recorded best val dice:   {config['best_val_dice']} (reference only)")
     print(f"Recorded best epoch:      {config['best_epoch']} (reference only)")
     print("=" * 70)
@@ -217,7 +221,7 @@ def main() -> None:
     scheduler = None
     if config["scheduler"]:
         # In a benchmark-only script, scheduler effect is minimal.
-        # We still include it so the setup matches the experiment config.
+        # I still include it so the setup matches the experiment config.
         scheduler = CosineAnnealingLR(optimizer, T_max=1)
 
     # -----------------------------------------------------------------
