@@ -2,7 +2,8 @@ __pycache__/
 *.pyc
 saved_models/*.pth
 dataset/oxford-iiit-pet/images/
-dataset/oxford-iiit-pet/annotations/
+dataset/oxford-iiit-pet/annotations/trimaps/
+dataset/oxford-iiit-pet/annotations/._trimaps
 src/imagine_check.py
 lab2_segmentation/submissions/
 submissions/*.csv
