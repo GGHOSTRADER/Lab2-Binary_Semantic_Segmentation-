@@ -10,7 +10,7 @@ from oxford_pet import OxfordPetDataset2015
 from evaluate import dice_score_from_logits, validate_one_epoch
 from models.unet import UNet2015
 from models.resnet34_unet import ResNet34UNet
-
+import argparse
 
 # -----------------------------
 # Paths
@@ -20,28 +20,26 @@ DATASET_ROOT = PROJECT_ROOT / "dataset" / "oxford-iiit-pet"
 
 
 # -----------------------------
-# Interactive architecture selection
+# CLI argument parsing
 # -----------------------------
-def prompt_model_type() -> str:
-    valid_options = {"unet2015", "resnet34_unet"}
-
-    print("\nSelect model architecture:")
-    print("  1) unet2015")
-    print("  2) resnet34_unet")
-
-    while True:
-        choice = input("\nEnter model_type [unet2015 / resnet34_unet]: ").strip()
-
-        if choice in valid_options:
-            return choice
-
-        print(
-            f"Invalid choice: {choice!r}. "
-            f"Please enter exactly one of: {sorted(valid_options)}"
-        )
 
 
-MODEL_TYPE = prompt_model_type()
+def parse_args() -> str:
+    parser = argparse.ArgumentParser(description="Train segmentation model")
+
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        required=True,
+        choices=["unet2015", "resnet34_unet"],
+        help="Model architecture to use",
+    )
+
+    args = parser.parse_args()
+    return args.model_type
+
+
+MODEL_TYPE = parse_args()
 
 
 # -----------------------------

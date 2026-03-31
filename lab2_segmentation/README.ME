@@ -1,4 +1,6 @@
+----------------------------------------------------
 Directory Tree for project to run
+----------------------------------------------------
 
 lab2_segmentation
 ├── README.ME
@@ -38,7 +40,9 @@ lab2_segmentation
 
 
 ----------------------------------------------------
-train.py
+Instructions to Run the LAB
+----------------------------------------------------
+File: train.py
 
 - Use: train both models, already calls datapreprocessing , model, train and validation .
   User must selected desired training. Will save best model weights.
@@ -49,25 +53,18 @@ train.py
   
   Step 2:
   In terminal:
-    python src/train.py 
+    For unet2015
+      python src/train.py --model_type unet2015
 
-  Step 3:
-    CLI Input required
-
-    Model asks :
-
-    Select model architecture:
-      1) unet2015
-      2) resnet34_unet
-
-    Enter model_type [unet2015 / resnet34_unet]: 
+    For resnet34_unet
+      python src/train.py --model_type resnet34_unet
 
 **IMPORTANT**
-No Flag required but must input the model in CLI
+MUST USE THE --model_type FLAG to run
 
 ----------------------------------------------------
 
-kaggle_style_evaluate.py 
+File: kaggle_style_evaluate.py 
 
 - Use: Validation post train/Val that reflects a close estimate to kaggle. Does not save anything, just prints results.
 
@@ -89,7 +86,7 @@ MUST USE THE --model_type FLAG to run
 
 ----------------------------------------------------
 
-inference.py
+File: inference.py
 
 - Use: do the final inference on unseen data from test set and create the RLE on csv for kaggle submission.
 
@@ -100,20 +97,20 @@ inference.py
   Step 2:
     For unet2015 kaggle style
     In terminal:
-      python src/inference.py --model_type unet2015   
+      python src/inference.py --model_type unet2015 
 
     for resnet34_unet kaggle style
     In terminal:
-      python src/inference.py --model_type resnet34_unet
+      python src/inference.py --model_type resnet34_unet --threshold 0.20 
 
 **IMPORTANT**
 MUST USE THE --model_type FLAG to run
 
 ----------------------------------------------------
 
-supporting_hyperparameter_files
+Folder: supporting_hyperparameter_files
 
-train_hyperparams.py
+File: train_hyperparams.py
 - Use: Was used to test different configurations loss function and learning rate
 - Launching of File:
   Step 1:
@@ -125,7 +122,7 @@ train_hyperparams.py
 **IMPORTANT**
 Works for UNET, must launch as module execution, so python + -m command 
 
-train_speedtest.py
+File: train_speedtest.py
   - Use: Was used to test different configurations of workers and batch since since training was very slow for UNET.
 
 - Launching of File:
@@ -137,6 +134,10 @@ train_speedtest.py
 
 **IMPORTANT**
 Works for UNET, must launch as module execution, so python + -m command
+
+
+Hyperparameters to Replicate train/Val and Inference:
+
 
 ----------------------------------------------------
 Use of AI Tools
