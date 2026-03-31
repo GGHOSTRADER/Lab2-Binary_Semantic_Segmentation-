@@ -343,12 +343,14 @@ def build_test_dataloader(
     dataset_root: str | Path,
     batch_size: int,
     num_workers: int,
+    model_type: str,
 ) -> DataLoader:
     test_dataset = OxfordPetDataset2015(
         root=dataset_root,
         split="test",
         augment=False,
         return_pet_id=True,
+        model_type=model_type,
     )
 
     use_pin_memory = torch.cuda.is_available()
@@ -476,6 +478,7 @@ def main() -> None:
         dataset_root=dataset_root,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        model_type=args.model_type,
     )
 
     print(f"Test dataset size: {len(test_loader.dataset)}")
